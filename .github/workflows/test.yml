@@ -46,6 +46,7 @@ jobs:
         shell: bash
         run: |
           curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          export PATH="$HOME/.roswell/bin:$PATH"
           echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
           ros install "sbcl-bin/$SBCL_VERSION"
           ros use "sbcl-bin/$SBCL_VERSION"
