@@ -1,0 +1,56 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: http-backend-dexador-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SBCL_VERSION: 2.4.11
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/http-protocol
+          path: _sib/http-protocol
+
+      - uses: actions/checkout@v4
+        with:
+          repository: egao1980/http-encoding-chipz
+          path: _sib/http-encoding-chipz
+
+      - name: Layout siblings
+        shell: bash
+        run: |
+          mkdir -p /tmp/ws
+          cp -a "$GITHUB_WORKSPACE" /tmp/ws/http-backend-dexador
+          cp -a "$GITHUB_WORKSPACE/_sib/http-protocol" /tmp/ws/http-protocol
+          cp -a "$GITHUB_WORKSPACE/_sib/http-encoding-chipz" /tmp/ws/http-encoding-chipz
+
+      - name: Install Roswell + test
+        working-directory: /tmp/ws/http-backend-dexador
+        shell: bash
+        run: |
+          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          export PATH="$HOME/.roswell/bin:$PATH"
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.roswell/bin:$PATH"
+          ros install "sbcl-bin/$SBCL_VERSION"
+          ros use "sbcl-bin/$SBCL_VERSION"
+          ros install qlot
+          qlot install
+          qlot exec ros -S . -e '(asdf:test-system "http-backend-dexador")'
