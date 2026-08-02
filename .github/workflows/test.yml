@@ -27,7 +27,6 @@ jobs:
         with:
           repository: egao1980/http-protocol
           path: _sib/http-protocol
-          ref: cursor/http-backend-dexador-a88c
 
       - uses: actions/checkout@v4
         with:
