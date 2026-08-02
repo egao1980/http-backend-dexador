@@ -1,0 +1,13 @@
+ql rove
+ql dexador
+ql quri
+ql chipz
+ql salza2
+ql trivial-gray-streams
+local http-protocol ../http-protocol
+local http-encoding-chipz ../http-encoding-chipz
+# Optional
+local http-encoding-brotli ../http-encoding-brotli
+local http-encoding-zstd ../http-encoding-zstd
+local cl-stack-brotli ../cl-stack-brotli
+local cl-stack-zstd ../cl-stack-zstd
