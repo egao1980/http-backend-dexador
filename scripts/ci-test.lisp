@@ -49,9 +49,11 @@
 
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
+(defvar *cl-stack-ssl-version* (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
+
 ;; cl+ssl OCI name is cl-plus-ssl (GHCR forbids '+'). Load before cl-stack-ssl.
-(ci-install "cl-plus-ssl" :version "latest" :asdf-name "cl+ssl")
-(ci-load "cl-stack-ssl" :version "3.4.1")
+(ci-install "cl-plus-ssl" :version *cl-stack-ssl-version* :asdf-name "cl+ssl")
+(ci-load "cl-stack-ssl" :version *cl-stack-ssl-version*)
 (ci-load "http-protocol" :version "0.1.0")
 (ci-load "http-encoding-chipz" :version "0.1.0")
 (ci-load "quri" :version "0.7.1")
