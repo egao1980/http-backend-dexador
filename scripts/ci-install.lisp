@@ -46,24 +46,25 @@
 
 (call-with-ci-muffles
  (lambda ()
-   (ci-install "cl-plus-ssl" :version "latest")
-   (ci-install "cl-stack-ssl" :version "3.4.1")
-   ;; Patch stale OCI source (DEFCONSTANT → DEFPARAMETER) until republished.
-   (let ((setup (probe-file
-                 (merge-pathnames
-                  "cl-stack-ssl/3.4.1/src/setup.lisp"
-                  (cl-repository-client/installer:systems-root)))))
-     (when setup
-       (let* ((text (uiop:read-file-string setup))
-              (fixed (search "(defconstant +openssl-version+" text :test #'char-equal))
-         (when fixed
-           (setf text (concatenate 'string
-                                   (subseq text 0 fixed)
-                                   "(defparameter +openssl-version+"
-                                   (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
-           (with-open-file (out setup :direction :output :if-exists :supersede)
-             (write-string text out))
-           (format t "~&; ci: patched ~a defconstant->defparameter~%" setup))))))
+   (let ((cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1")))
+     (ci-install "cl-plus-ssl" :version "latest")
+     (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
+     ;; Patch stale OCI source (DEFCONSTANT → DEFPARAMETER) until republished.
+     (let ((setup (probe-file
+                   (merge-pathnames
+                    (format nil "cl-stack-ssl/~a/src/setup.lisp" cl-stack-ssl-version)
+                    (cl-repository-client/installer:systems-root)))))
+       (when setup
+         (let* ((text (uiop:read-file-string setup))
+                (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
+           (when fixed
+             (setf text (concatenate 'string
+                                     (subseq text 0 fixed)
+                                     "(defparameter +openssl-version+"
+                                     (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
+             (with-open-file (out setup :direction :output :if-exists :supersede)
+               (write-string text out))
+             (format t "~&; ci: patched ~a defconstant->defparameter~%" setup)))))))
    (ci-load "http-protocol" :version "0.1.0")
    (ci-load "http-encoding-chipz" :version "0.1.0")
    (ci-load "quri" :version "0.7.1")
