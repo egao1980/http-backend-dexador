@@ -12,13 +12,15 @@ concurrency:
 
 env:
   SBCL_VERSION: 2.4.11
+  ROSWELL_VERSION: "26.02.116"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +35,8 @@ jobs:
           repository: egao1980/http-encoding-chipz
           path: _sib/http-encoding-chipz
 
-      - name: Layout siblings
+      - name: Layout siblings (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p /tmp/ws
@@ -41,16 +44,67 @@ jobs:
           cp -a "$GITHUB_WORKSPACE/_sib/http-protocol" /tmp/ws/http-protocol
           cp -a "$GITHUB_WORKSPACE/_sib/http-encoding-chipz" /tmp/ws/http-encoding-chipz
 
-      - name: Install Roswell + test
-        working-directory: /tmp/ws/http-backend-dexador
+      - name: Install Roswell (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
-          export PATH="$HOME/.roswell/bin:$PATH"
           echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.roswell/bin:$PATH"
+
+      - name: Install Roswell (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sL "https://github.com/roswell/roswell/releases/download/v${ROSWELL_VERSION}/roswell_${ROSWELL_VERSION}_amd64.zip" \
+            -o /tmp/roswell.zip
+          rm -rf /c/roswell && mkdir -p /c/roswell
+          unzip -qo /tmp/roswell.zip -d /c/roswell
+          echo "/c/roswell/roswell" >> "$GITHUB_PATH"
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+
+      - name: Install SBCL
+        shell: bash
+        run: |
           ros install "sbcl-bin/$SBCL_VERSION"
           ros use "sbcl-bin/$SBCL_VERSION"
+
+      # dexador → cl+ssl → OpenSSL DLLs. Pull published windows overlay (no rebuild).
+      - name: Install oras (Windows)
+        if: runner.os == 'Windows'
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.2.3
+
+      - name: Stage OpenSSL DLLs (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p /tmp/ssl-pull /tmp/ssl-native
+          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:3.4.1" --platform windows/amd64 -o /tmp/ssl-pull
+          tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
+          NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
+          echo "OPENSSL_NATIVE=$NAT" >> "$GITHUB_ENV"
+          echo "$NAT" >> "$GITHUB_PATH"
+          ls -la "$NAT"
+
+      - name: Test (Unix)
+        if: runner.os != 'Windows'
+        working-directory: /tmp/ws/http-backend-dexador
+        shell: bash
+        run: |
           ros install qlot
           qlot install
           qlot exec ros -S . -e '(asdf:test-system "http-backend-dexador")'
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Transitive natives: OpenSSL for cl+ssl (via dexador).
+          export PATH="${OPENSSL_NATIVE}:${PATH}"
+          ros install rove dexador chipz salza2 trivial-gray-streams quri cffi cl+ssl
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_sib/http-protocol//:$(pwd)/_sib/http-encoding-chipz//:"
+          ros -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
+              -e "(push (uiop:ensure-directory-pathname (uiop:getenv \"OPENSSL_NATIVE\")) cffi:*foreign-library-directories*)" \
+              -e '(asdf:test-system "http-backend-dexador")' -q
