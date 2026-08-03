@@ -8,6 +8,19 @@
         (uiop:quit 1)))
 
 (asdf:load-system "cl-repository-client")
+#+sbcl (setf sb-ext:*on-package-variance* '(:warn))
+
+(defun ci-install (oci-name &key version (asdf-name oci-name))
+  "Install OCI package OCI-NAME (e.g. cl-plus-ssl), then asdf-load ASDF-NAME (e.g. cl+ssl)."
+  (format t "~&; ci: cl-repo install ~a~@[:~a~] (asdf ~a)~%" oci-name version asdf-name)
+  (let* ((ns "egao1980/cl-systems")
+         (repo (format nil "~a/~a" ns oci-name))
+         (ver (or version "latest")))
+    (cl-repository-client/installer:install-system "https://ghcr.io" repo ver)
+    (cl-repository-client/asdf-integration:configure-asdf-source-registry)
+    (cl-repository-client/asdf-integration:load-system-init-files)
+    (asdf:load-system asdf-name)))
+
 
 (defun ci-load (name &key version)
   (format t "~&; ci: cl-repo load ~a~@[:~a~]~%" name version)
@@ -25,7 +38,7 @@
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
 ;; cl+ssl OCI name is cl-plus-ssl (GHCR forbids '+'). Load before cl-stack-ssl.
-(ci-load "cl-plus-ssl" :version "latest")
+(ci-install "cl-plus-ssl" :version "latest" :asdf-name "cl+ssl")
 (ci-load "cl-stack-ssl" :version "3.4.1")
 (ci-load "http-protocol" :version "0.1.0")
 (ci-load "http-encoding-chipz" :version "0.1.0")
