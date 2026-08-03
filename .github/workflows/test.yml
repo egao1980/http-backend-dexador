@@ -13,6 +13,7 @@ concurrency:
 env:
   SBCL_VERSION: 2.4.11
   ROSWELL_VERSION: "26.02.116"
+  CL_REPOSITORY_REF: "v0.9.0"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -30,22 +31,9 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: egao1980/http-protocol
-          path: _sib/http-protocol
-
-      - uses: actions/checkout@v4
-        with:
-          repository: egao1980/http-encoding-chipz
-          path: _sib/http-encoding-chipz
-
-      - name: Layout siblings (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p /tmp/ws
-          cp -a "$GITHUB_WORKSPACE" /tmp/ws/http-backend-dexador
-          cp -a "$GITHUB_WORKSPACE/_sib/http-protocol" /tmp/ws/http-protocol
-          cp -a "$GITHUB_WORKSPACE/_sib/http-encoding-chipz" /tmp/ws/http-encoding-chipz
+          repository: egao1980/cl-repository
+          ref: ${{ env.CL_REPOSITORY_REF }}
+          path: .cl-repository
 
       - name: Install Roswell (Unix)
         if: runner.os != 'Windows'
@@ -71,50 +59,13 @@ jobs:
           ros install "sbcl-bin/$SBCL_VERSION"
           ros use "sbcl-bin/$SBCL_VERSION"
 
-      # dexador → cl+ssl → OpenSSL DLLs. Pull published windows overlay (no rebuild).
-      - name: Install oras (Windows)
-        if: runner.os == 'Windows'
-        uses: oras-project/setup-oras@v1
-        with:
-          version: 1.2.3
-
-      - name: Stage OpenSSL DLLs (Windows)
-        if: runner.os == 'Windows'
+      - name: Bootstrap cl-repository-client (QL deps for client only)
         shell: bash
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          mkdir -p /tmp/ssl-pull /tmp/ssl-native
-          oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:3.4.1" --platform windows/amd64 -o /tmp/ssl-pull
-          tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
-          NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
-          if [[ -z "$NAT" ]]; then
-            echo "native directory not found under /tmp/ssl-native" >&2
-            exit 1
-          fi
-          echo "OPENSSL_NATIVE=$NAT" >> "$GITHUB_ENV"
-          echo "$NAT" >> "$GITHUB_PATH"
-          ls -la "$NAT"
+          ros -e '(ql:quickload (quote ("yason" "ironclad" "babel" "dexador" "quri" "chipz" "flexi-streams" "cl-ppcre" "cl-base64" "trivial-features" "salza2" "archive")) :silent t)' -q
 
-      - name: Test (Unix)
-        if: runner.os != 'Windows'
-        working-directory: /tmp/ws/http-backend-dexador
+      - name: cl-repo install deps + test
         shell: bash
         run: |
-          ros install qlot
-          qlot install
-          qlot exec ros -S . -e '(asdf:test-system "http-backend-dexador")'
-
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          # Transitive natives: OpenSSL for cl+ssl (via dexador).
-          export PATH="${OPENSSL_NATIVE}:${PATH}"
-          ros install rove dexador chipz salza2 trivial-gray-streams quri cffi \
-            cl+ssl blackbird cl-cookie
-          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_sib/http-protocol//:$(pwd)/_sib/http-encoding-chipz//:"
-          ros -S . \
-              -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
-              -e '(asdf:load-system :cffi)' \
-              -e "(let ((d (uiop:getenv \"OPENSSL_NATIVE\"))) (when (and d (plusp (length d))) (push (uiop:ensure-directory-pathname d) cffi:*foreign-library-directories*)))" \
-              -e '(asdf:test-system "http-backend-dexador")' -q
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
+          ros -l scripts/ci-test.lisp -q
