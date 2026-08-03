@@ -49,7 +49,7 @@
                   (cl-repository-client/installer:systems-root)))))
      (when setup
        (let* ((text (uiop:read-file-string setup))
-              (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
+              (fixed (search "(defconstant +openssl-version+" text :test #'char-equal))
          (when fixed
            (setf text (concatenate 'string
                                    (subseq text 0 fixed)
@@ -57,7 +57,7 @@
                                    (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
            (with-open-file (out setup :direction :output :if-exists :supersede)
              (write-string text out))
-           (format t "~&; ci: patched ~a defconstant→defparameter~%" setup)))))
+           (format t "~&; ci: patched ~a defconstant→defparameter~%" setup))))))
    (ci-load "http-protocol" :version "0.1.0")
    (ci-load "http-encoding-chipz" :version "0.1.0")
    (ci-load "quri" :version "0.7.1")
