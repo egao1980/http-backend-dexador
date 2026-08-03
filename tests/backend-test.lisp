@@ -79,6 +79,24 @@
       (ok (= 200 (response-status res)))
       (ok (equalp (%bytes "facade") (response-body res))))))
 
+(deftest send-injects-auth-and-range
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend :auth '(:basic "user" "pass")))
+         (seen-headers nil)
+         (*dexador-request-fn*
+          (lambda (url &key headers &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-headers headers)
+            (values #() 206 (%ht) "https://example.com/x"))))
+    (send backend client
+          (make-http-request :method :get
+                             :url "https://example.com/x"
+                             :range '(0 99)))
+    (ok (string= "Basic dXNlcjpwYXNz"
+                 (cdr (assoc "authorization" seen-headers :test #'string-equal))))
+    (ok (string= "bytes=0-99"
+                 (cdr (assoc "range" seen-headers :test #'string-equal))))))
+
 (deftest send-passes-cookie-jar
   (let* ((backend (make-instance 'dexador-backend))
          (client (make-http-client backend))

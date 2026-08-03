@@ -96,6 +96,10 @@
          (proxy (http-client-proxy client))
          (verify (http-client-verify client))
          (cookie-jar (resolve-cookie-jar client request :url url)))
+    (setf headers (inject-auth-range-headers
+                   headers
+                   :auth (effective-auth client request)
+                   :range (http-request-range request)))
     (when ae
       (setf headers (acons "accept-encoding" ae
                            (remove "accept-encoding" headers
