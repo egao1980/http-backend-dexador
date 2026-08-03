@@ -1,4 +1,6 @@
 ;;;; Phase 1: install OCI deps with system OpenSSL (client→dexador→cl+ssl).
+;;;; Install cl-stack-ssl LAST — its cl-repo-init rewires CFFI and breaks
+;;;; subsequent HTTPS pulls (Undefined callback: CL+SSL::PEM-PASSWORD-CALLBACK).
 ;;;; Do not load cl-stack-ssl here — overlay natives need a fresh image + loader path.
 
 (setf *debugger-hook*
@@ -42,38 +44,45 @@
    (lambda ()
      (if version
          (cl-repo:load-system name :version version :sources *ci-ql-sources*)
-         (cl-repo:load-system name :sources *ci-ql-sources*)))))
+         (cl-repo:load-system name :sources *ci-ql-sources*))))
+  (unless (asdf:find-system name nil)
+    (error "ci-load: ~a not installed/findable" name)))
+
+(defun ci-patch-stack-ssl (&optional (version "3.4.1"))
+  "Patch stale OCI source (DEFCONSTANT -> DEFPARAMETER) until republished."
+  (let ((setup (probe-file
+                (merge-pathnames
+                 (format nil "cl-stack-ssl/~a/src/setup.lisp" version)
+                 (cl-repository-client/installer:systems-root)))))
+    (when setup
+      (let* ((text (uiop:read-file-string setup))
+             (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
+        (when fixed
+          (setf text (concatenate 'string
+                                  (subseq text 0 fixed)
+                                  "(defparameter +openssl-version+"
+                                  (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
+          (with-open-file (out setup :direction :output :if-exists :supersede)
+            (write-string text out))
+          (format t "~&; ci: patched ~a defconstant->defparameter~%" setup))))))
 
 (call-with-ci-muffles
  (lambda ()
    (let ((cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1")))
+     ;; cl+ssl first (system OpenSSL). All other OCI pulls before cl-stack-ssl.
      (ci-install "cl-plus-ssl" :version "latest")
+     (ci-load "http-protocol" :version "0.1.0")
+     (ci-load "http-encoding-chipz" :version "0.1.0")
+     (ci-load "quri" :version "0.7.1")
+     (ci-load "chipz" :version "0.8")
+     (ci-load "salza2" :version "2.1")
+     (dolist (n '("dexador" "rove" "trivial-gray-streams"))
+       (unless (asdf:find-system n nil)
+         (format t "~&; ci: ql fallback ~a~%" n)
+         (ql:quickload n :silent t)))
+     ;; LAST: overlay package (init rewires SSL; no more HTTPS pulls after this).
      (ci-install "cl-stack-ssl" :version cl-stack-ssl-version)
-     ;; Patch stale OCI source (DEFCONSTANT → DEFPARAMETER) until republished.
-     (let ((setup (probe-file
-                   (merge-pathnames
-                    (format nil "cl-stack-ssl/~a/src/setup.lisp" cl-stack-ssl-version)
-                    (cl-repository-client/installer:systems-root)))))
-       (when setup
-         (let* ((text (uiop:read-file-string setup))
-                (fixed (search "(defconstant +openssl-version+" text :test #'char-equal)))
-           (when fixed
-             (setf text (concatenate 'string
-                                     (subseq text 0 fixed)
-                                     "(defparameter +openssl-version+"
-                                     (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
-             (with-open-file (out setup :direction :output :if-exists :supersede)
-               (write-string text out))
-             (format t "~&; ci: patched ~a defconstant->defparameter~%" setup)))))))
-   (ci-load "http-protocol" :version "0.1.0")
-   (ci-load "http-encoding-chipz" :version "0.1.0")
-   (ci-load "quri" :version "0.7.1")
-   (ci-load "chipz" :version "0.8")
-   (ci-load "salza2" :version "2.1")
-   (dolist (n '("dexador" "rove" "trivial-gray-streams"))
-     (unless (asdf:find-system n nil)
-       (format t "~&; ci: ql fallback ~a~%" n)
-       (ql:quickload n :silent t)))))
+     (ci-patch-stack-ssl cl-stack-ssl-version))))
 
 (format t "~&; ci: install phase done~%")
 (uiop:quit 0)
