@@ -66,36 +66,15 @@
             (write-string text out))
           (format t "~&; ci: patched ~a defconstant->defparameter~%" setup))))))
 
-(defun ci-use-sibling-http-protocol-p ()
-  "True when workflow checked out egao1980/http-protocol under ./http-protocol/."
-  (probe-file (merge-pathnames "http-protocol/http-protocol.asd"
-                               (uiop:getcwd))))
-
-(defun ci-register-sibling-http-protocol ()
-  (let ((dir (truename (merge-pathnames "http-protocol/" (uiop:getcwd)))))
-    (format t "~&; ci: sibling http-protocol → ~a~%" dir)
-    (pushnew dir asdf:*central-registry* :test #'equal)
-    dir))
-
 (call-with-ci-muffles
  (lambda ()
    (let ((cl-stack-ssl-version (or (uiop:getenv "CL_STACK_SSL_VERSION") "3.4.1"))
-         (sibling-p (ci-use-sibling-http-protocol-p)))
+         (http-protocol-version (or (uiop:getenv "HTTP_PROTOCOL_VERSION") "0.1.0")))
      ;; cl+ssl first (system OpenSSL). All other OCI pulls before cl-stack-ssl.
      (ci-install "cl-plus-ssl" :version "latest")
-     (if sibling-p
-         ;; PR chain: prefer git checkout over stale OCI http-protocol:0.1.0
-         (progn
-           (ci-register-sibling-http-protocol)
-           (ci-load "quri" :version "0.7.1")
-           (dolist (n '("trivial-gray-streams" "blackbird" "cl-cookie" "cl-base64" "babel"))
-             (unless (asdf:find-system n nil)
-               (format t "~&; ci: ql fallback ~a (http-protocol dep)~%" n)
-               (ql:quickload n :silent t))))
-         (ci-load "http-protocol" :version "0.1.0"))
+     (ci-load "http-protocol" :version http-protocol-version)
      (ci-load "http-encoding-chipz" :version "0.1.0")
-     (unless sibling-p
-       (ci-load "quri" :version "0.7.1"))
+     (ci-load "quri" :version "0.7.1")
      (ci-load "chipz" :version "0.8")
      (ci-load "salza2" :version "2.1")
      (dolist (n '("dexador" "rove" "trivial-gray-streams"))

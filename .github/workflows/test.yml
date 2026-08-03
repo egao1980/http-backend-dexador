@@ -15,8 +15,7 @@ env:
   ROSWELL_VERSION: "26.02.116"
   CL_REPOSITORY_REF: "main"
   CL_STACK_SSL_VERSION: "3.4.1"
-  # Override until http-protocol#9 is merged + OCI 0.1.0 republished.
-  HTTP_PROTOCOL_REF: "cursor/http-body-streams-a88c"
+  HTTP_PROTOCOL_VERSION: "0.1.0"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -31,13 +30,6 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
-
-      - name: Checkout http-protocol sibling
-        uses: actions/checkout@v4
-        with:
-          repository: egao1980/http-protocol
-          ref: ${{ env.HTTP_PROTOCOL_REF }}
-          path: http-protocol
 
       - uses: actions/checkout@v4
         with:
@@ -81,8 +73,7 @@ jobs:
       - name: cl-repo install deps
         shell: bash
         run: |
-          # Prefer sibling http-protocol over any OCI pin pulled transitively.
-          export CL_SOURCE_REGISTRY="$(pwd)/http-protocol/:$(pwd)//:$(pwd)/.cl-repository//:"
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
           ros -l scripts/ci-install.lisp -q
 
       - name: Stage OpenSSL overlay for test process
@@ -113,5 +104,5 @@ jobs:
       - name: Test with overlay OpenSSL
         shell: bash
         run: |
-          export CL_SOURCE_REGISTRY="$(pwd)/http-protocol/:$(pwd)//:$(pwd)/.cl-repository//:"
+          export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/.cl-repository//:"
           ros -l scripts/ci-test.lisp -q
