@@ -107,8 +107,11 @@ jobs:
         run: |
           # Transitive natives: OpenSSL for cl+ssl (via dexador).
           export PATH="${OPENSSL_NATIVE}:${PATH}"
-          ros install rove dexador chipz salza2 trivial-gray-streams quri cffi cl+ssl
+          ros install rove dexador chipz salza2 trivial-gray-streams quri cffi \
+            cl+ssl blackbird cl-cookie
           export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_sib/http-protocol//:$(pwd)/_sib/http-encoding-chipz//:"
-          ros -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
-              -e "(progn (asdf:load-system :cffi) (push (uiop:ensure-directory-pathname (uiop:getenv \"OPENSSL_NATIVE\")) cffi:*foreign-library-directories*))" \
+          ros -S . \
+              -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
+              -e '(asdf:load-system :cffi)' \
+              -e "(let ((d (uiop:getenv \"OPENSSL_NATIVE\"))) (when (and d (plusp (length d))) (push (uiop:ensure-directory-pathname d) cffi:*foreign-library-directories*)))" \
               -e '(asdf:test-system "http-backend-dexador")' -q
