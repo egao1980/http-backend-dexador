@@ -110,5 +110,5 @@ jobs:
           ros install rove dexador chipz salza2 trivial-gray-streams quri cffi cl+ssl
           export CL_SOURCE_REGISTRY="$(pwd)//:$(pwd)/_sib/http-protocol//:$(pwd)/_sib/http-encoding-chipz//:"
           ros -e '(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format *error-output* "~&UNHANDLED: ~A~%" c) (uiop:quit 1)))' \
-              -e "(push (uiop:ensure-directory-pathname (uiop:getenv \"OPENSSL_NATIVE\")) cffi:*foreign-library-directories*)" \
+              -e "(progn (asdf:load-system :cffi) (push (uiop:ensure-directory-pathname (uiop:getenv \"OPENSSL_NATIVE\")) cffi:*foreign-library-directories*))" \
               -e '(asdf:test-system "http-backend-dexador")' -q
