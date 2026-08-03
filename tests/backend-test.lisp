@@ -73,6 +73,67 @@
       (ok (equalp (%bytes "payload")
                   (decode-content-coding :gzip octets))))))
 
+(deftest request-form-data-urlencoded
+  "http-protocol 0.2 :form-data → urlencoded + Content-Type."
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-content nil)
+         (seen-ct nil)
+         (*dexador-request-fn*
+          (lambda (url &key headers content &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-content content
+                  seen-ct (cdr (assoc "content-type" headers
+                                      :test #'string-equal)))
+            (values #() 204 (%ht) "https://example.com/"))))
+    (send backend client
+          (make-http-request :method :post
+                             :url "https://example.com/"
+                             :form-data '(("q" . "hi there"))))
+    (ok (string-equal "application/x-www-form-urlencoded" seen-ct))
+    (ok (equalp (%bytes "q=hi+there")
+                (if (streamp seen-content)
+                    (slurp-octets seen-content)
+                    seen-content)))))
+
+(deftest request-typed-data-text
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-content nil)
+         (seen-ct nil)
+         (*dexador-request-fn*
+          (lambda (url &key headers content &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-content content
+                  seen-ct (cdr (assoc "content-type" headers
+                                      :test #'string-equal)))
+            (values #() 204 (%ht) "https://example.com/"))))
+    (send backend client
+          (make-http-request :method :post
+                             :url "https://example.com/"
+                             :data "hello"
+                             :data-type :text))
+    (ok (search "text/plain" seen-ct :test #'char-equal))
+    (ok (equalp (%bytes "hello")
+                (if (streamp seen-content)
+                    (slurp-octets seen-content)
+                    seen-content)))))
+
+(deftest response-data-with-deserializer
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (*dexador-request-fn*
+          (lambda (url &key &allow-other-keys)
+            (values (%bytes "{\"ok\":true}") 200
+                    (%ht "content-type" "application/json")
+                    url))))
+    (let ((res (send backend client
+                     (make-http-request :method :get
+                                        :url "https://example.com/"))))
+      (with-data-deserializer (:json (lambda (o)
+                                       (babel:octets-to-string o :encoding :utf-8)))
+        (ok (search "ok" (response-data res :json) :test #'char-equal))))))
+
 (deftest request-stream-content-not-slurped
   "Stream :content stays a stream (buffered) for dexador."
   (let* ((backend (make-instance 'dexador-backend))

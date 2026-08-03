@@ -95,7 +95,7 @@
      ;; cl+ssl first (system OpenSSL). All other OCI pulls before cl-stack-ssl.
      ;; Lisp deps: omit :version → cl-repo resolves newest published tag.
      (ci-install "cl-plus-ssl" :version "latest") ; real :latest tag on this package
-     (ci-load "http-protocol")
+     (ci-load "http-protocol" :version "0.2.0")
      (ci-load "http-encoding-chipz")
      (ci-load "quri")
      (ci-load "chipz")
