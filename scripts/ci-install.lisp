@@ -24,8 +24,9 @@
 
 (defparameter *ci-ql-sources*
   '(("babel" :ql)
-    ("trivial-features" :ql))
-  "Already loaded via client QL bootstrap — do not reinstall from OCI.")
+    ("trivial-features" :ql)
+    ("cl-unicode" :ql))
+  "QL pins: babel already bootstrapped; cl-unicode OCI v0.1.6 lacks idna-mapping.")
 
 (cl-repo:add-registry "https://ghcr.io" :namespace "egao1980/cl-systems" :priority :prepend)
 
@@ -62,7 +63,7 @@
                                    (subseq text (+ fixed (length "(defconstant +openssl-version+")))))
            (with-open-file (out setup :direction :output :if-exists :supersede)
              (write-string text out))
-           (format t "~&; ci: patched ~a defconstant→defparameter~%" setup))))))
+           (format t "~&; ci: patched ~a defconstant->defparameter~%" setup))))))
    (ci-load "http-protocol" :version "0.1.0")
    (ci-load "http-encoding-chipz" :version "0.1.0")
    (ci-load "quri" :version "0.7.1")
