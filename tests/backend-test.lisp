@@ -67,8 +67,45 @@
                              :content (%bytes "payload")
                              :content-encoding :gzip))
     (ok (string= "gzip" seen-ce))
-    (ok (equalp (%bytes "payload")
-                (decode-content-coding :gzip seen-content)))))
+    (let ((octets (if (streamp seen-content)
+                      (slurp-octets seen-content)
+                      seen-content)))
+      (ok (equalp (%bytes "payload")
+                  (decode-content-coding :gzip octets))))))
+
+(deftest request-stream-content-not-slurped
+  "Stream :content stays a stream (buffered) for dexador."
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-content nil)
+         (*dexador-request-fn*
+          (lambda (url &key content &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-content content)
+            (values #() 204 (%ht) "https://example.com/"))))
+    (with-open-stream (src (make-octet-input-stream (%bytes "stream-body")))
+      (send backend client
+            (make-http-request :method :post
+                               :url "https://example.com/"
+                               :content src))
+      (ok (streamp seen-content))
+      (ok (equalp (%bytes "stream-body") (slurp-octets seen-content))))))
+
+(deftest want-stream-wraps-buffered
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (*dexador-request-fn*
+          (lambda (url &key want-stream &allow-other-keys)
+            (ok want-stream)
+            (values (make-octet-input-stream (%bytes "streamed"))
+                    200 (%ht "content-type" "text/plain") url))))
+    (let ((res (send backend client
+                     (make-http-request :method :get
+                                        :url "https://example.com/"
+                                        :want-stream t))))
+      (ok (streamp (response-body res)))
+      (ok (typep (response-body res) 'buffered-binary-input-stream))
+      (ok (equalp (%bytes "streamed") (slurp-octets (body-stream res)))))))
 
 (deftest facade-with-backend
   (let* ((*http-backend* (make-instance 'dexador-backend))

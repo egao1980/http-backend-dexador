@@ -2,6 +2,7 @@
 
 ;;; Sync http-protocol backend over dexador.
 ;;; Soft-load http-encoding-brotli / http-encoding-zstd via http-protocol probes.
+;;; Bodies are streams/octets only — no filesystem interaction.
 
 (defclass dexador-backend (http-backend)
   ()
@@ -42,41 +43,37 @@
                  (mapcar #'normalize-content-coding spec)))
         (t (string spec))))
 
-(defun %prepare-content (content coding)
-  "Return (values content header-value). CODING nil → unchanged."
-  (if (null coding)
-      (values content nil)
-      (let* ((c (normalize-content-coding coding))
-             (octets (etypecase content
-                       (null (make-array 0 :element-type '(unsigned-byte 8)))
-                       (stream (slurp-octets content))
-                       ((or string vector) (coerce-to-octets content))))
-             (enc (encode-content-coding c octets)))
-        (values enc (string-downcase (symbol-name c))))))
+(defun %merge-extra-headers (headers extra)
+  (let ((h headers))
+    (dolist (pair extra h)
+      (setf h (acons (car pair) (cdr pair)
+                     (remove (car pair) h :key #'car :test #'string-equal))))))
 
 (defun apply-response-content-encoding (body headers &key (decompress t))
   "Decode BODY according to Content-Encoding in HEADERS.
-   Dexador already unwraps gzip/deflate — those tokens are skipped.
-   When DECOMPRESS is NIL, only skip our extra decoding (br/zstd).
-   Returns (values new-body new-headers)."
-  (let* ((ce (gethash "content-encoding" headers))
-         (codings (parse-content-encoding ce)))
-    (cond
-      ((or (null decompress) (null codings))
-       (values body headers))
-      (t
-       ;; dexador already applied gzip/deflate; only run remaining.
-       (let* ((remaining (remove-if (lambda (c) (member c '(:gzip :deflate)))
-                                    codings))
-              (decoded (if remaining
-                           (decode-content-codings remaining body)
-                           body))
-              (ht (let ((n (make-hash-table :test #'equal)))
-                    (maphash (lambda (k v) (setf (gethash k n) v)) headers)
-                    (remhash "content-encoding" n)
-                    (remhash "content-length" n)
-                    n)))
-         (values decoded ht))))))
+   Stream bodies use WRAP-RESPONSE-BODY-STREAM (Gray CE chain).
+   Vector bodies: skip gzip/deflate (dexador already decoded those)."
+  (cond
+    ((streamp body)
+     (wrap-response-body-stream body headers :decompress decompress))
+    (t
+     (let* ((ce (gethash "content-encoding" headers))
+            (codings (parse-content-encoding ce)))
+       (cond
+         ((or (null decompress) (null codings))
+          (values body headers))
+         (t
+          (let* ((remaining (remove-if (lambda (c) (member c '(:gzip :deflate)))
+                                       codings))
+                 (decoded (if remaining
+                              (decode-content-codings remaining body)
+                              body))
+                 (ht (let ((n (make-hash-table :test #'equal)))
+                       (maphash (lambda (k v) (setf (gethash k n) v)) headers)
+                       (remhash "content-encoding" n)
+                       (remhash "content-length" n)
+                       n)))
+            (values decoded ht))))))))
 
 (defun %call-dexador (&rest args)
   (if *dexador-request-fn*
@@ -104,13 +101,21 @@
       (setf headers (acons "accept-encoding" ae
                            (remove "accept-encoding" headers
                                    :key #'car :test #'string-equal))))
-    (multiple-value-bind (content ce-header)
-        (%prepare-content (http-request-content request)
-                          (http-request-content-encoding request))
-      (when ce-header
-        (setf headers (acons "content-encoding" ce-header
-                             (remove "content-encoding" headers
-                                     :key #'car :test #'string-equal))))
+    (multiple-value-bind (content extra-headers content-length)
+        (prepare-request-body request)
+      (setf headers (%merge-extra-headers headers extra-headers))
+      (when content-length
+        (setf headers (%merge-extra-headers
+                       headers
+                       (list (cons "content-length"
+                                   (princ-to-string content-length))))))
+      ;; Real dexador cannot write Gray streams (no stream typecase). Tests
+      ;; bind *dexador-request-fn*. Production stream uploads → async backend.
+      (when (and (streamp content) (null *dexador-request-fn*))
+        (error 'unsupported-operation
+               :operation :stream-body
+               :message
+               "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
       (handler-case
           (multiple-value-bind (body status resp-headers uri)
               (%call-dexador
@@ -133,11 +138,9 @@
                    (set-cookies (merge-response-cookies
                                  cookie-jar final-url resp-headers)))
               (multiple-value-bind (body* headers*)
-                  (if (http-request-want-stream request)
-                      (values body resp-headers)
-                      (apply-response-content-encoding
-                       body resp-headers
-                       :decompress (http-request-decompress request)))
+                  (apply-response-content-encoding
+                   body resp-headers
+                   :decompress (http-request-decompress request))
                 (make-instance 'http-response
                                :status status
                                :headers headers*
@@ -146,7 +149,6 @@
                                :cookies set-cookies
                                :request request))))
         (dexador:http-request-failed (e)
-          ;; Default: do not signal on 4xx/5xx — build a response (httpx style).
           (let ((body (dexador:response-body e))
                 (status (dexador:response-status e))
                 (hdrs (dexador:response-headers e))
