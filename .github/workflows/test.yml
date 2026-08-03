@@ -84,6 +84,10 @@ jobs:
           oras pull "ghcr.io/egao1980/cl-systems/cl-stack-ssl:3.4.1" --platform windows/amd64 -o /tmp/ssl-pull
           tar -xzf /tmp/ssl-pull/native-library.tar.gz -C /tmp/ssl-native
           NAT="$(find /tmp/ssl-native -type d -name native | head -1)"
+          if [[ -z "$NAT" ]]; then
+            echo "native directory not found under /tmp/ssl-native" >&2
+            exit 1
+          fi
           echo "OPENSSL_NATIVE=$NAT" >> "$GITHUB_ENV"
           echo "$NAT" >> "$GITHUB_PATH"
           ls -la "$NAT"
