@@ -43,41 +43,38 @@
         (t (string spec))))
 
 (defun %prepare-content (content coding)
-  "Return (values content header-value). CODING nil → unchanged."
-  (if (null coding)
-      (values content nil)
-      (let* ((c (normalize-content-coding coding))
-             (octets (etypecase content
-                       (null (make-array 0 :element-type '(unsigned-byte 8)))
-                       (stream (slurp-octets content))
-                       ((or string vector) (coerce-to-octets content))))
-             (enc (encode-content-coding c octets)))
-        (values enc (string-downcase (symbol-name c))))))
+  "Return (values content header-value). Streams stay streams (buffered)."
+  (prepare-request-content content :coding coding))
 
 (defun apply-response-content-encoding (body headers &key (decompress t))
   "Decode BODY according to Content-Encoding in HEADERS.
-   Dexador already unwraps gzip/deflate — those tokens are skipped.
-   When DECOMPRESS is NIL, only skip our extra decoding (br/zstd).
+   Dexador already unwraps gzip/deflate — those tokens are skipped for
+   materialised (vector) bodies. Stream bodies use WRAP-RESPONSE-BODY-STREAM
+   (full CE chain via Gray streams — caller must pass :decompress carefully
+   when dexador already decoded gzip).
    Returns (values new-body new-headers)."
-  (let* ((ce (gethash "content-encoding" headers))
-         (codings (parse-content-encoding ce)))
-    (cond
-      ((or (null decompress) (null codings))
-       (values body headers))
-      (t
-       ;; dexador already applied gzip/deflate; only run remaining.
-       (let* ((remaining (remove-if (lambda (c) (member c '(:gzip :deflate)))
-                                    codings))
-              (decoded (if remaining
-                           (decode-content-codings remaining body)
-                           body))
-              (ht (let ((n (make-hash-table :test #'equal)))
-                    (maphash (lambda (k v) (setf (gethash k n) v)) headers)
-                    (remhash "content-encoding" n)
-                    (remhash "content-length" n)
-                    n)))
-         (values decoded ht))))))
-
+  (cond
+    ((streamp body)
+     (wrap-response-body-stream body headers :decompress decompress))
+    (t
+     (let* ((ce (gethash "content-encoding" headers))
+            (codings (parse-content-encoding ce)))
+       (cond
+         ((or (null decompress) (null codings))
+          (values body headers))
+         (t
+          ;; dexador already applied gzip/deflate; only run remaining.
+          (let* ((remaining (remove-if (lambda (c) (member c '(:gzip :deflate)))
+                                       codings))
+                 (decoded (if remaining
+                              (decode-content-codings remaining body)
+                              body))
+                 (ht (let ((n (make-hash-table :test #'equal)))
+                       (maphash (lambda (k v) (setf (gethash k n) v)) headers)
+                       (remhash "content-encoding" n)
+                       (remhash "content-length" n)
+                       n)))
+            (values decoded ht))))))))
 (defun %call-dexador (&rest args)
   (if *dexador-request-fn*
       (apply *dexador-request-fn* args)
@@ -133,11 +130,18 @@
                    (set-cookies (merge-response-cookies
                                  cookie-jar final-url resp-headers)))
               (multiple-value-bind (body* headers*)
-                  (if (http-request-want-stream request)
-                      (values body resp-headers)
-                      (apply-response-content-encoding
-                       body resp-headers
-                       :decompress (http-request-decompress request)))
+                  (apply-response-content-encoding
+                   body resp-headers
+                   ;; Dexador auto-decodes gzip/deflate for vector bodies.
+                   ;; For streams, WRAP path must not double-decode those:
+                   ;; pass decompress only for our extra codings when stream.
+                   :decompress
+                   (cond
+                     ((not (http-request-decompress request)) nil)
+                     ((streamp body)
+                      ;; Stream path: dexador does not auto-decode — decode all.
+                      t)
+                     (t t)))
                 (make-instance 'http-response
                                :status status
                                :headers headers*
