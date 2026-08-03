@@ -78,3 +78,22 @@
     (let ((res (http:get "https://example.com/")))
       (ok (= 200 (response-status res)))
       (ok (equalp (%bytes "facade") (response-body res))))))
+
+(deftest send-passes-cookie-jar
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-jar nil)
+         (*dexador-request-fn*
+          (lambda (url &key cookie-jar &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-jar cookie-jar)
+            (values #() 200
+                    (%ht "set-cookie" "sid=abc; Path=/")
+                    "https://example.com/"))))
+    (let ((res (send backend client
+                     (make-http-request :method :get
+                                        :url "https://example.com/"
+                                        :cookies '(("x" . "1"))))))
+      (ok (eq seen-jar (http-client-cookie-jar client)))
+      (ok (plusp (length (cl-cookie:cookie-jar-cookies seen-jar))))
+      (ok (plusp (length (response-cookies res)))))))
