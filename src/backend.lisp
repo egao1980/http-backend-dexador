@@ -94,7 +94,8 @@
          (max-redirects (or (http-request-max-redirects request)
                             (http-client-max-redirects client)))
          (proxy (http-client-proxy client))
-         (verify (http-client-verify client)))
+         (verify (http-client-verify client))
+         (cookie-jar (resolve-cookie-jar client request :url url)))
     (when ae
       (setf headers (acons "accept-encoding" ae
                            (remove "accept-encoding" headers
@@ -113,6 +114,7 @@
                :method method
                :headers headers
                :content content
+               :cookie-jar cookie-jar
                :connect-timeout (if (numberp timeout) timeout nil)
                :read-timeout (if (numberp timeout) timeout nil)
                :max-redirects (or max-redirects 5)
@@ -121,38 +123,46 @@
                :force-binary (http-request-force-binary request)
                :want-stream (http-request-want-stream request)
                :keep-alive t)
-            (multiple-value-bind (body* headers*)
-                (if (http-request-want-stream request)
-                    (values body resp-headers)
-                    (apply-response-content-encoding
-                     body resp-headers
-                     :decompress (http-request-decompress request)))
-              (make-instance 'http-response
-                             :status status
-                             :headers headers*
-                             :body body*
-                             :url (if (typep uri 'quri:uri)
-                                      (quri:render-uri uri)
-                                      uri)
-                             :request request)))
+            (let* ((final-url (if (typep uri 'quri:uri)
+                                  (quri:render-uri uri)
+                                  uri))
+                   (set-cookies (merge-response-cookies
+                                 cookie-jar final-url resp-headers)))
+              (multiple-value-bind (body* headers*)
+                  (if (http-request-want-stream request)
+                      (values body resp-headers)
+                      (apply-response-content-encoding
+                       body resp-headers
+                       :decompress (http-request-decompress request)))
+                (make-instance 'http-response
+                               :status status
+                               :headers headers*
+                               :body body*
+                               :url final-url
+                               :cookies set-cookies
+                               :request request))))
         (dexador:http-request-failed (e)
           ;; Default: do not signal on 4xx/5xx — build a response (httpx style).
           (let ((body (dexador:response-body e))
                 (status (dexador:response-status e))
                 (hdrs (dexador:response-headers e))
                 (uri (dexador:request-uri e)))
-            (multiple-value-bind (body* headers*)
-                (apply-response-content-encoding
-                 body hdrs
-                 :decompress (http-request-decompress request))
-              (let ((res (make-instance 'http-response
-                                        :status status
-                                        :headers headers*
-                                        :body body*
-                                        :url (if (typep uri 'quri:uri)
-                                                 (quri:render-uri uri)
-                                                 (princ-to-string uri))
-                                        :request request)))
-                (if (http-request-raise-for-status request)
-                    (raise-for-status res)
-                    res)))))))))
+            (let* ((final-url (if (typep uri 'quri:uri)
+                                  (quri:render-uri uri)
+                                  (princ-to-string uri)))
+                   (set-cookies (merge-response-cookies
+                                 cookie-jar final-url hdrs)))
+              (multiple-value-bind (body* headers*)
+                  (apply-response-content-encoding
+                   body hdrs
+                   :decompress (http-request-decompress request))
+                (let ((res (make-instance 'http-response
+                                          :status status
+                                          :headers headers*
+                                          :body body*
+                                          :url final-url
+                                          :cookies set-cookies
+                                          :request request)))
+                  (if (http-request-raise-for-status request)
+                      (raise-for-status res)
+                      res))))))))))
