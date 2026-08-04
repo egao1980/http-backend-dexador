@@ -47,7 +47,44 @@
                                         :url "https://example.com/"))))
       (ok (= 200 (response-status res)))
       (ok (equalp raw (response-body res)))
-      (ok (null (response-header res "content-encoding"))))))
+      (ok (null (response-header res "content-encoding")))
+      (ok (eq :http/1.1 (response-http-version res))))))
+
+(deftest http2-preference-not-available
+  "Dexador has no HTTP/2 — forced :http/2 signals."
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend :http-version :http/2))
+         (*dexador-request-fn*
+          (lambda (&rest args)
+            (declare (ignore args))
+            (error "dexador should not be called for forced HTTP/2"))))
+    (ok (signals (send backend client
+                       (make-http-request :method :get
+                                          :url "https://example.com/"))
+                 'http-version-not-available)))
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (*dexador-request-fn*
+          (lambda (&rest args)
+            (declare (ignore args))
+            (error "dexador should not be called for forced HTTP/2"))))
+    (ok (signals (send backend client
+                       (make-http-request :method :get
+                                          :url "https://example.com/"
+                                          :http-version :http/2))
+                 'http-version-not-available))))
+
+(deftest http-version-auto-and-11-ok
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend :http-version :auto))
+         (*dexador-request-fn*
+          (lambda (url &key &allow-other-keys)
+            (values (%bytes "ok") 200 (%ht) url))))
+    (let ((res (send backend client
+                     (make-http-request :method :get
+                                        :url "https://example.com/"
+                                        :http-version :http/1.1))))
+      (ok (eq :http/1.1 (response-http-version res))))))
 
 (deftest request-content-encoding-gzip
   (let* ((backend (make-instance 'dexador-backend))
