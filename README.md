@@ -21,3 +21,14 @@ qlot exec ros -S . -e '(asdf:test-system "http-backend-dexador")'
 (let ((*http-backend* (http-backend-dexador:make-dexador-backend)))
   (http:get "https://example.com/"))
 ```
+
+## Publish
+
+Source-only OCI publish is centralized in [`cl-stack-systems`](https://github.com/egao1980/cl-stack-systems)
+(`imports/http-backend-dexador/qlfile` pin + shared `publish.yml`). Packaging metadata lives in the `.asd`
+(`auto-package-spec`):
+
+```bash
+gh workflow run publish.yml -R egao1980/cl-stack-systems -f import=http-backend-dexador
+```
+
