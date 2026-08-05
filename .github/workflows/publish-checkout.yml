@@ -1,0 +1,60 @@
+# Emergency publish from this repo while cl-systems package ACL still grants
+# write to the original publisher repo (not cl-stack-systems).
+name: Publish checkout to cl-systems
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "OCI tag (default: .asd :version)"
+        required: false
+        default: ""
+
+env:
+  PACKAGER_TAG: "0.10.0"
+  SBCL_VERSION: "2.6.7"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oras-project/setup-oras@v2
+        with:
+          version: 1.2.3
+
+      - name: Install Roswell + SBCL
+        run: |
+          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
+          ros install "sbcl-bin/$SBCL_VERSION"
+          ros use "sbcl-bin/$SBCL_VERSION"
+
+      - name: Quicklisp
+        run: |
+          curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
+          ros -e '(load "/tmp/quicklisp.lisp")' \
+              -e '(quicklisp-quickstart:install :path (merge-pathnames "quicklisp/" (user-homedir-pathname)))' \
+              -e '(ql-util:without-prompting (ql:add-to-init-file))' -q
+
+      - name: Pull packager
+        run: |
+          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          rm -rf /tmp/cl-repo-pull
+          mkdir -p /tmp/cl-repo-pull ~/.local/share/cl-systems
+          oras pull "ghcr.io/egao1980/cl-repository/cl-repository-packager:${PACKAGER_TAG}" -o /tmp/cl-repo-pull/
+          for f in /tmp/cl-repo-pull/*.tar.gz; do
+            tar -xzf "$f" -C ~/.local/share/cl-systems/
+          done
+
+      - name: Publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          PKG_SYSTEM: http-backend-dexador
+          PKG_VERSION: ${{ inputs.version }}
+        run: ros -l scripts/publish-checkout.lisp -q
