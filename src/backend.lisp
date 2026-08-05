@@ -8,6 +8,11 @@
   ()
   (:default-initargs :name "dexador"))
 
+(defmethod backend-http-versions ((backend dexador-backend))
+  "Dexador is HTTP/1.1 only (RFC 9112). Forced :http/2 → http-version-not-available."
+  (declare (ignore backend))
+  '(:http/1.1))
+
 (defun make-dexador-backend ()
   "Load chipz encoding backend (hard dep) and return a DEXADOR-BACKEND."
   (asdf:load-system "http-encoding-chipz")
@@ -81,6 +86,11 @@
       (apply #'dexador:request args)))
 
 (defmethod send ((backend dexador-backend) client request &key)
+  ;; Dexador is HTTP/1.1 only — refuse forced HTTP/2 up front.
+  (ensure-http-version-available
+   (effective-http-version client request)
+   :http/1.1
+   :backend-name "dexador")
   (let* ((url (http-request-url request))
          (method (http-request-method request))
          (headers (%merge-headers (http-client-headers client)
@@ -147,6 +157,7 @@
                                :body body*
                                :url final-url
                                :cookies set-cookies
+                               :http-version :http/1.1
                                :request request))))
         (dexador:http-request-failed (e)
           (let ((body (dexador:response-body e))
@@ -168,6 +179,7 @@
                                           :body body*
                                           :url final-url
                                           :cookies set-cookies
+                                          :http-version :http/1.1
                                           :request request)))
                   (if (http-request-raise-for-status request)
                       (raise-for-status res)
