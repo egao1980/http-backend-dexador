@@ -12,7 +12,6 @@ on:
 
 env:
   PACKAGER_TAG: "0.10.0"
-  SBCL_VERSION: "2.6.7"
 
 jobs:
   publish:
@@ -27,19 +26,18 @@ jobs:
         with:
           version: 1.2.3
 
-      - name: Install Roswell + SBCL
-        run: |
-          curl -sL https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
-          echo "$HOME/.roswell/bin" >> "$GITHUB_PATH"
-          ros install "sbcl-bin/$SBCL_VERSION"
-          ros use "sbcl-bin/$SBCL_VERSION"
+      - name: Install SBCL + git
+        run: sudo apt-get update && sudo apt-get install -y sbcl git
 
-      - name: Quicklisp
+      - name: Install Quicklisp
         run: |
           curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp
-          ros -e '(load "/tmp/quicklisp.lisp")' \
-              -e '(quicklisp-quickstart:install :path (merge-pathnames "quicklisp/" (user-homedir-pathname)))' \
-              -e '(ql-util:without-prompting (ql:add-to-init-file))' -q
+          sbcl --noinform --non-interactive \
+            --load /tmp/quicklisp.lisp \
+            --eval '(quicklisp-quickstart:install :path #p"~/quicklisp/")'
+          sbcl --noinform --non-interactive \
+            --load ~/quicklisp/setup.lisp \
+            --eval '(ql-util:without-prompting (ql:add-to-init-file))'
 
       - name: Pull packager
         env:
@@ -59,4 +57,4 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           PKG_SYSTEM: http-backend-dexador
           PKG_VERSION: ${{ inputs.version }}
-        run: ros -l scripts/publish-checkout.lisp -q
+        run: sbcl --noinform --non-interactive --load scripts/publish-checkout.lisp
