@@ -42,6 +42,8 @@ jobs:
               -e '(ql-util:without-prompting (ql:add-to-init-file))' -q
 
       - name: Pull packager
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
           rm -rf /tmp/cl-repo-pull
