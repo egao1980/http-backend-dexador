@@ -1,12 +1,12 @@
 (defsystem "http-backend-dexador"
-  :version "0.1.2"
+  :version "0.1.3"
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("http-protocol" "dexador" "http-encoding-chipz" "quri")
+  :depends-on ("http-protocol" "dexador" "quri")
   :properties
   (:cl-repo
-   (:ci (:with ("cl-stack-ssl")
+   (:ci (:with ("cl-stack-ssl" "http-encoding-chipz")
          :load-before-test ("cl+ssl" "cl-stack-ssl")
          :record-versions (("cl-stack-ssl" . "CL_STACK_SSL_VERSION")))))
   :serial t

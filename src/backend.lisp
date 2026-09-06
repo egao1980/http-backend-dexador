@@ -1,7 +1,7 @@
 (in-package #:http-backend-dexador)
 
 ;;; Sync http-protocol backend over dexador.
-;;; Soft-load http-encoding-brotli / http-encoding-zstd via http-protocol probes.
+;;; Soft-load content encodings via http-protocol probes.
 ;;; Bodies are streams/octets only — no filesystem interaction.
 
 (defclass dexador-backend (http-backend)
@@ -14,11 +14,11 @@
   '(:http/1.1))
 
 (defun make-dexador-backend ()
-  "Load chipz encoding backend (hard dep) and return a DEXADOR-BACKEND."
-  (asdf:load-system "http-encoding-chipz")
-  ;; Soft overlays — ignore failures (Accept-Encoding omits them).
+  "Return a DEXADOR-BACKEND. Content encodings are soft-loaded."
+  (ignore-errors (asdf:load-system "http-encoding-chipz"))
   (ignore-errors (asdf:load-system "http-encoding-brotli"))
   (ignore-errors (asdf:load-system "http-encoding-zstd"))
+  (ignore-errors (asdf:load-system "http-encoding-snappy"))
   (make-instance 'dexador-backend))
 
 (defvar *dexador-request-fn* nil
