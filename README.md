@@ -8,6 +8,7 @@ MIT. Sync [`http-protocol`](https://github.com/egao1980/http-protocol) backend o
 | Response CE | Auto-decode; dexador already unwraps gzip/deflate — we handle `br`/`zstd` |
 | Request CE | Opt-in `:content-encoding` |
 | Bodies | `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` (streams → async) |
+| Timeouts | `effective-timeout` → dexador `:connect-timeout` / `:read-timeout` (default 30s). usocket/OS timeouts become `http-timeout-error`. |
 | 4xx/5xx | Returned as `http-response` (httpx style); `:raise-for-status t` to signal |
 
 ```bash

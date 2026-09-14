@@ -232,6 +232,68 @@
     (ok (string= "bytes=0-99"
                  (cdr (assoc "range" seen-headers :test #'string-equal))))))
 
+(deftest send-applies-effective-timeout
+  "Plist / HTTP-TIMEOUT / default-NIL all become numeric dexador deadlines."
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-connect nil)
+         (seen-read nil)
+         (*dexador-request-fn*
+          (lambda (url &key connect-timeout read-timeout &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-connect connect-timeout
+                  seen-read read-timeout)
+            (values (%bytes "ok") 200 (%ht) "https://example.com/"))))
+    (send backend client
+          (make-http-request :method :get
+                             :url "https://example.com/"
+                             :timeout '(:connect 1 :read 2 :total 3)))
+    (ok (= 1 seen-connect))
+    (ok (= 2 seen-read)))
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend :timeout (make-http-timeout :total 9)))
+         (seen-connect nil)
+         (seen-read nil)
+         (*dexador-request-fn*
+          (lambda (url &key connect-timeout read-timeout &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-connect connect-timeout
+                  seen-read read-timeout)
+            (values (%bytes "ok") 200 (%ht) "https://example.com/"))))
+    (send backend client
+          (make-http-request :method :get :url "https://example.com/"))
+    (ok (= 9 seen-connect))
+    (ok (= 9 seen-read)))
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-connect nil)
+         (*dexador-request-fn*
+          (lambda (url &key connect-timeout &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-connect connect-timeout)
+            (values (%bytes "ok") 200 (%ht) "https://example.com/"))))
+    (send backend client
+          (make-http-request :method :get :url "https://example.com/"))
+    (ok (numberp seen-connect))
+    (ok (>= seen-connect 30))))
+
+(define-condition %usocket-timeout-error (error) ()
+  (:report (lambda (c s)
+             (declare (ignore c))
+             (format s "usocket timeout"))))
+
+(deftest send-remaps-timeout-errors
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (*dexador-request-fn*
+          (lambda (&rest args)
+            (declare (ignore args))
+            (error '%usocket-timeout-error))))
+    (ok (signals (send backend client
+                       (make-http-request :method :get
+                                          :url "https://example.com/"))
+                 'http-timeout-error))))
+
 (deftest send-passes-cookie-jar
   (let* ((backend (make-instance 'dexador-backend))
          (client (make-http-client backend))
