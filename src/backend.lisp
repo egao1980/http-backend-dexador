@@ -92,13 +92,20 @@
         (and (symbolp type)
              (search "TIMEOUT" (symbol-name type) :test #'char-equal)))))
 
+(defun %dexador-seconds (seconds)
+  "Whole seconds for dexador (>= 1 when a deadline is set).
+   usocket's :receive-timeout on SBCL/Windows multiplies by 1000 and binds a
+   (signed-byte 32) alien, so 30.0 → 30000.0 type-errors and every request
+   dies; integers are what dexador's own defaults use."
+  (and seconds (max 1 (ceiling seconds))))
+
 (defun %dexador-timeouts (request client)
   "Map protocol HTTP-TIMEOUT onto dexador :connect-timeout / :read-timeout.
    Previously only NUMBER timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL
    meant no deadline and SEND could hang (keep-alive reuse, fat PDFs)."
   (let ((timeout (effective-timeout request client)))
-    (values (timeout-connect-seconds timeout)
-            (timeout-read-seconds timeout))))
+    (values (%dexador-seconds (timeout-connect-seconds timeout))
+            (%dexador-seconds (timeout-read-seconds timeout)))))
 
 (defmethod send ((backend dexador-backend) client request &key)
   ;; Dexador is HTTP/1.1 only — refuse forced HTTP/2 up front.

@@ -274,8 +274,26 @@
             (values (%bytes "ok") 200 (%ht) "https://example.com/"))))
     (send backend client
           (make-http-request :method :get :url "https://example.com/"))
-    (ok (numberp seen-connect))
-    (ok (>= seen-connect 30))))
+    (ok (integerp seen-connect))
+    (ok (>= seen-connect 30)))
+  ;; Fractional seconds round up to whole seconds (usocket/Windows wants
+  ;; an integer millisecond count; 0.5 must not become "no timeout").
+  (let* ((backend (make-instance 'dexador-backend))
+         (client (make-http-client backend))
+         (seen-connect nil)
+         (seen-read nil)
+         (*dexador-request-fn*
+          (lambda (url &key connect-timeout read-timeout &allow-other-keys)
+            (declare (ignore url))
+            (setf seen-connect connect-timeout
+                  seen-read read-timeout)
+            (values (%bytes "ok") 200 (%ht) "https://example.com/"))))
+    (send backend client
+          (make-http-request :method :get
+                             :url "https://example.com/"
+                             :timeout '(:connect 0.5 :read 2.25)))
+    (ok (eql 1 seen-connect))
+    (ok (eql 3 seen-read))))
 
 (define-condition %usocket-timeout-error (error) ()
   (:report (lambda (c s)
