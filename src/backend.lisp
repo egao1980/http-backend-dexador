@@ -85,6 +85,21 @@
       (apply *dexador-request-fn* args)
       (apply #'dexador:request args)))
 
+(defun %timeout-error-p (condition)
+  "Dexador/usocket/OS timeout types are not a single CLOS class."
+  (let ((type (type-of condition)))
+    (or (typep condition 'http-timeout-error)
+        (and (symbolp type)
+             (search "TIMEOUT" (symbol-name type) :test #'char-equal)))))
+
+(defun %dexador-timeouts (request client)
+  "Map protocol HTTP-TIMEOUT onto dexador :connect-timeout / :read-timeout.
+   Previously only NUMBER timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL
+   meant no deadline and SEND could hang (keep-alive reuse, fat PDFs)."
+  (let ((timeout (effective-timeout request client)))
+    (values (timeout-connect-seconds timeout)
+            (timeout-read-seconds timeout))))
+
 (defmethod send ((backend dexador-backend) client request &key)
   ;; Dexador is HTTP/1.1 only — refuse forced HTTP/2 up front.
   (ensure-http-version-available
@@ -96,8 +111,6 @@
          (headers (%merge-headers (http-client-headers client)
                                   (http-request-headers request)))
          (ae (%accept-encoding-header (http-request-accept-encoding request)))
-         (timeout (or (http-request-timeout request)
-                      (http-client-timeout client)))
          (max-redirects (or (http-request-max-redirects request)
                             (http-client-max-redirects client)))
          (proxy (http-client-proxy client))
@@ -126,61 +139,55 @@
                :operation :stream-body
                :message
                "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
-      (handler-case
-          (multiple-value-bind (body status resp-headers uri)
-              (%call-dexador
-               url
-               :method method
-               :headers headers
-               :content content
-               :cookie-jar cookie-jar
-               :connect-timeout (if (numberp timeout) timeout nil)
-               :read-timeout (if (numberp timeout) timeout nil)
-               :max-redirects (or max-redirects 5)
-               :proxy proxy
-               :insecure (not verify)
-               :force-binary (http-request-force-binary request)
-               :want-stream (http-request-want-stream request)
-               :keep-alive t)
-            (let* ((final-url (if (typep uri 'quri:uri)
-                                  (quri:render-uri uri)
-                                  uri))
-                   (set-cookies (merge-response-cookies
-                                 cookie-jar final-url resp-headers)))
-              (multiple-value-bind (body* headers*)
-                  (apply-response-content-encoding
-                   body resp-headers
-                   :decompress (http-request-decompress request))
-                (make-instance 'http-response
-                               :status status
-                               :headers headers*
-                               :body body*
-                               :url final-url
-                               :cookies set-cookies
-                               :http-version :http/1.1
-                               :request request))))
-        (dexador:http-request-failed (e)
-          (let ((body (dexador:response-body e))
-                (status (dexador:response-status e))
-                (hdrs (dexador:response-headers e))
-                (uri (dexador:request-uri e)))
-            (let* ((final-url (if (typep uri 'quri:uri)
-                                  (quri:render-uri uri)
-                                  (princ-to-string uri)))
-                   (set-cookies (merge-response-cookies
-                                 cookie-jar final-url hdrs)))
-              (multiple-value-bind (body* headers*)
-                  (apply-response-content-encoding
-                   body hdrs
-                   :decompress (http-request-decompress request))
-                (let ((res (make-instance 'http-response
-                                          :status status
-                                          :headers headers*
-                                          :body body*
-                                          :url final-url
-                                          :cookies set-cookies
-                                          :http-version :http/1.1
-                                          :request request)))
+      (multiple-value-bind (connect-timeout read-timeout)
+          (%dexador-timeouts request client)
+        (flet ((finish (body status resp-headers uri)
+                 (let* ((final-url (if (typep uri 'quri:uri)
+                                       (quri:render-uri uri)
+                                       (if uri (princ-to-string uri) url)))
+                        (set-cookies (merge-response-cookies
+                                      cookie-jar final-url resp-headers)))
+                   (multiple-value-bind (body* headers*)
+                       (apply-response-content-encoding
+                        body resp-headers
+                        :decompress (http-request-decompress request))
+                     (make-instance 'http-response
+                                    :status status
+                                    :headers headers*
+                                    :body body*
+                                    :url final-url
+                                    :cookies set-cookies
+                                    :http-version :http/1.1
+                                    :request request)))))
+          (handler-bind
+              ((error
+                (lambda (c)
+                  (when (and (%timeout-error-p c)
+                             (not (typep c 'http-timeout-error)))
+                    (error 'http-timeout-error
+                           :message (princ-to-string c))))))
+            (handler-case
+                (multiple-value-bind (body status resp-headers uri)
+                    (%call-dexador
+                     url
+                     :method method
+                     :headers headers
+                     :content content
+                     :cookie-jar cookie-jar
+                     :connect-timeout connect-timeout
+                     :read-timeout read-timeout
+                     :max-redirects (or max-redirects 5)
+                     :proxy proxy
+                     :insecure (not verify)
+                     :force-binary (http-request-force-binary request)
+                     :want-stream (http-request-want-stream request)
+                     :keep-alive t)
+                  (finish body status resp-headers uri))
+              (dexador:http-request-failed (e)
+                (let ((res (finish (dexador:response-body e)
+                                   (dexador:response-status e)
+                                   (dexador:response-headers e)
+                                   (dexador:request-uri e))))
                   (if (http-request-raise-for-status request)
                       (raise-for-status res)
                       res))))))))))
