@@ -90,28 +90,60 @@
       (declare (ignore c r))
       (ok (and (= 5 total) (null explicit)) "a read longer than the total is covered by the deadline"))))
 
-(deftest lisp-bio-requests-use-a-fresh-connection
-  (flet ((seen (url timeout)
-           (let* ((seen nil)
-                  (*dexador-request-fn*
-                   (lambda (u &key keep-alive use-connection-pool &allow-other-keys)
-                     (setf seen (list keep-alive use-connection-pool
-                                      cl+ssl:*default-unwrap-stream-p*))
-                     (values (%bytes "ok") 200 (%ht) u))))
-             (send (make-instance 'dexador-backend)
-                   (make-http-client (make-instance 'dexador-backend))
-                   (make-http-request :url url :timeout timeout))
-             seen)))
+(defun %seen-pooling (url timeout &key (method :get) proxy)
+  "SEND one mocked request. → (keep-alive use-connection-pool unwrap-p pool)
+   as dexador saw them; POOL is the DEXADOR:*CONNECTION-POOL* bound."
+  (let* ((seen nil)
+         (*dexador-request-fn*
+          (lambda (u &key keep-alive use-connection-pool &allow-other-keys)
+            (setf seen (list keep-alive use-connection-pool
+                             cl+ssl:*default-unwrap-stream-p*
+                             dexador:*connection-pool*))
+            (values (%bytes "ok") 200 (%ht) u))))
+    (send (make-instance 'dexador-backend)
+          (make-http-client (make-instance 'dexador-backend)
+                            :proxy (make-http-proxy-config :system nil :use-system-proxy nil))
+          (make-http-request :url url :timeout timeout :method method :proxy proxy))
+    seen))
+
+(deftest lisp-bio-requests-use-their-own-pool
+  (flet ((flags (url timeout) (subseq (%seen-pooling url timeout) 0 3))
+         (pool (url timeout &rest keys) (fourth (apply #'%seen-pooling url timeout keys))))
     #-(or windows win32)
-    (ok (equal '(nil nil nil) (seen "https://example.com/" '(:read 1)))
-        "HTTPS + explicit read: no pool, no keep-alive, Lisp BIO")
+    (ok (equal '(t t nil) (flags "https://example.com/" '(:read 1)))
+        "HTTPS + explicit read: keep-alive and a pool, Lisp BIO")
     #+(or windows win32)
-    (ok (equal '(t t t) (seen "https://example.com/" '(:read 1)))
+    (ok (equal '(t t t) (flags "https://example.com/" '(:read 1)))
         "Windows: dexador runs over WinHTTP, whose receive timeout holds for HTTPS")
-    (ok (equal '(t t t) (seen "http://example.com/" '(:read 1)))
-        "plain HTTP keeps the pool (dexador's fd-stream timeout works there)")
-    (ok (equal '(t t t) (seen "https://example.com/" 5))
-        "HTTPS with a TOTAL only keeps the pool and the socket BIO")))
+    (ok (equal '(t t t) (flags "http://example.com/" '(:read 1)))
+        "plain HTTP: the pool, keep-alive and the default BIO setting")
+    (ok (equal '(t t t) (flags "https://example.com/" 5))
+        "HTTPS with a TOTAL only keeps the pool and the socket BIO")
+    (testing "a pooled connection is only handed to a request that would open it the same way"
+      (let ((http-1 (pool "http://example.com/" '(:read 1)))
+            (http-2 (pool "http://example.com/" '(:read 2)))
+            (https-5 (pool "https://example.com/" 5))
+            (https-9 (pool "https://example.com/" 9)))
+        (ok (eq http-1 (pool "http://example.com/" '(:read 1))) "same read timeout: same pool")
+        (ok (not (eq http-1 http-2)) "plain HTTP: another read timeout, another pool")
+        (ok (not (eq http-1 dexador:*connection-pool*)) "never dexador's global pool")
+        (ok (eq https-5 https-9)
+            "HTTPS over the socket BIO: one pool (that BIO never sees the read timeout)")
+        #-(or windows win32)
+        (ok (not (eq https-5 (pool "https://example.com/" '(:read 1))))
+            "HTTPS over the Lisp BIO: its own pool")
+        (ok (not (eq http-1 (pool "http://example.com/" '(:read 1)
+                                  :proxy "http://proxy.test:3128")))
+            "a proxied request never shares a direct request's pool")))
+    (testing "POST and PATCH start from an empty pool (dexador resends on a reused one)"
+      (let ((get-pool (pool "http://example.com/" '(:read 1))))
+        (dolist (method '(:post :patch))
+          (let ((p (pool "http://example.com/" '(:read 1) :method method)))
+            (ok (and p (not (eq p get-pool)) (not (eq p dexador:*connection-pool*)))
+                (format nil "~A: a staging pool, not the shared one" method))))
+        (dolist (method '(:put :delete :head :options))
+          (ok (eq get-pool (pool "http://example.com/" '(:read 1) :method method))
+              (format nil "~A is idempotent: the shared pool" method)))))))
 
 ;;; #24 — live loopback: deadlines fire, progress is not cut off
 

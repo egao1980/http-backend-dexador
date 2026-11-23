@@ -108,3 +108,84 @@
       (let ((slow (count-if (lambda (e) (search "/slow" (cdr e))) log)))
         (ok (= 1 slow)
             (format nil "GET /slow reached the server ~D time(s): ~S" slow log))))))
+
+(defun %pooled-sequence (slow-seconds steps)
+  "Run STEPS, a list of (method path timeout), in order on one dexador
+   backend against a keep-alive origin. → (values results seconds log):
+   RESULTS and SECONDS per step (a result is the response or the condition),
+   LOG the (connection-number . request-line) pairs the origin saw, oldest
+   first."
+  (multiple-value-bind (port stop log) (%keep-alive-server slow-seconds)
+    (unwind-protect
+        (let* ((base (format nil "http://127.0.0.1:~D" port))
+               (backend (make-dexador-backend))
+               (client (make-http-client backend))
+               (results '()) (seconds '()))
+          (loop for (method path timeout) in steps
+                do (let ((start (get-internal-real-time)))
+                     (push (handler-case
+                               (send backend client
+                                     (make-http-request :method method
+                                                        :url (concatenate 'string base path)
+                                                        :timeout timeout))
+                             (error (e) e))
+                           results)
+                     (push (%seconds-since start) seconds)))
+          (values (nreverse results) (nreverse seconds) (reverse (car log))))
+      (funcall stop))))
+
+(deftest keep-alive-still-reuses-connections
+  #+(or windows win32) (skip "Windows: dexador runs over WinHTTP")
+  #-(or windows win32)
+  (testing "three GETs with one timeout share one connection; another timeout opens another"
+    (multiple-value-bind (results secs log)
+        (%pooled-sequence 0 '((:get "/a" (:read 3)) (:get "/b" (:read 3)) (:get "/c" (:read 3))
+                              (:get "/d" (:read 4)) (:get "/e" (:read 3))))
+      (declare (ignore secs))
+      (ok (every (lambda (r) (typep r 'http-response)) results) (format nil "~S" results))
+      (let ((conns (mapcar #'car log)))
+        (ok (= 1 (first conns) (second conns) (third conns) (fifth conns))
+            (format nil "/a /b /c /e on one connection: ~S" log))
+        (ok (/= (first conns) (fourth conns))
+            (format nil "/d (:read 4) on its own connection: ~S" log))))))
+
+(deftest post-is-not-resent-after-a-read-timeout
+  #+(or windows win32) (skip "Windows: dexador runs over WinHTTP")
+  #-(or windows win32)
+  (testing "GET / opens a pooled connection; POST /slow (:read 1, server silent 3 s) times out once"
+    (multiple-value-bind (results secs log)
+        (%pooled-sequence 3 '((:get "/" (:read 1)) (:post "/slow" (:read 1))))
+      (ok (typep (first results) 'http-response) (format nil "GET: ~A" (first results)))
+      (ok (typep (second results) 'http-timeout-error)
+          (format nil "POST: ~A" (type-of (second results))))
+      (ok (< (second secs) 2.0) (format nil "POST returned after ~,1F s" (second secs)))
+      (let ((posts (remove-if-not (lambda (e) (search "POST" (cdr e))) log)))
+        (ok (= 1 (length posts)) (format nil "POST reached the origin ~D time(s): ~S"
+                                         (length posts) log))
+        (ok (and posts (/= (car (first posts)) (car (first log))))
+            "the POST went out on a fresh connection, not the pooled one")))))
+
+(deftest post-connection-goes-back-to-the-pool
+  #+(or windows win32) (skip "Windows: dexador runs over WinHTTP")
+  #-(or windows win32)
+  (testing "POST opens a fresh connection; the GET after it reuses that connection"
+    (multiple-value-bind (results secs log)
+        (%pooled-sequence 0 '((:post "/p" (:read 3)) (:get "/g" (:read 3))))
+      (declare (ignore secs))
+      (ok (every (lambda (r) (typep r 'http-response)) results) (format nil "~S" results))
+      (ok (and (= 2 (length log)) (= (car (first log)) (car (second log))))
+          (format nil "one connection: ~S" log)))))
+
+(deftest connection-pools-are-bounded
+  (testing "more distinct timeouts than *max-connection-pools* keep at most that many pools"
+    (clear-connection-pools)
+    (let ((*dexador-request-fn* (lambda (u &rest args) (declare (ignore args))
+                                  (values (%bytes "ok") 200 (%ht) u))))
+      (loop for read from 1 to 12
+            do (send (make-instance 'dexador-backend)
+                     (make-http-client (make-instance 'dexador-backend))
+                     (make-http-request :url "http://example.com/" :timeout (list :read read)))))
+    (ok (<= (length http-backend-dexador::*connection-pools*) *max-connection-pools*)
+        (format nil "~D pools" (length http-backend-dexador::*connection-pools*)))
+    (clear-connection-pools)
+    (ok (null http-backend-dexador::*connection-pools*))))

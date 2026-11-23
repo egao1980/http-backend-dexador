@@ -183,6 +183,90 @@
   #+(or windows win32) nil
   #-(or windows win32) (and explicit-read (%https-url-p url) t))
 
+(defvar *max-connection-pools* 8
+  "Pools kept at once. Making one more closes the idle connections of the
+   least recently used.")
+
+(defvar *connection-pools* '()
+  "((key . dexador pool) ...), most recently used first.")
+
+(defvar *connection-pools-lock* (bt:make-lock "http-backend-dexador pools"))
+
+(defun %pool-key (url read-seconds lisp-bio proxy)
+  "Requests whose connections behave alike share a pool. Plain HTTP: by the
+   fd-stream read timeout. HTTPS over cl+ssl's socket BIO: all together, since
+   that BIO never sees the read timeout (the deadline bounds those requests).
+   HTTPS over the Lisp BIO: by read timeout. PROXY is part of the key, as
+   dexador's own key leaves it out and would hand a proxied connection to a
+   direct request for the same origin."
+  (list (cond ((not (%https-url-p url)) :http)
+              (lisp-bio :https-lisp-bio)
+              (t :https))
+        (and (or lisp-bio (not (%https-url-p url))) read-seconds)
+        proxy))
+
+(defun %connection-pool (key)
+  "The dexador connection pool for KEY, made on first use."
+  (let ((evicted nil) (pool nil))
+    (bt:with-lock-held (*connection-pools-lock*)
+      (let ((entry (assoc key *connection-pools* :test #'equal)))
+        (if entry
+            (setf *connection-pools*
+                  (cons entry (delete entry *connection-pools* :test #'eq)))
+            (progn
+              (setf entry (cons key (dexador:make-connection-pool)))
+              (push entry *connection-pools*)
+              (when (> (length *connection-pools*) *max-connection-pools*)
+                (setf evicted (car (last *connection-pools*))
+                      *connection-pools* (butlast *connection-pools*)))))
+        (setf pool (cdr entry))))
+    (when evicted
+      (let ((dexador:*connection-pool* (cdr evicted)))
+        (ignore-errors (dexador:clear-connection-pool))))
+    pool))
+
+(defun clear-connection-pools ()
+  "Close every idle connection the backend keeps, in all of its pools."
+  (let ((pools (bt:with-lock-held (*connection-pools-lock*)
+                 (shiftf *connection-pools* '()))))
+    (dolist (entry pools)
+      (let ((dexador:*connection-pool* (cdr entry)))
+        (ignore-errors (dexador:clear-connection-pool))))
+    (values)))
+
+(defun %idempotent-method-p (method)
+  "RFC 9110 §9.2.2: GET HEAD OPTIONS TRACE PUT DELETE."
+  (member method '(:get :head :options :trace :put :delete) :test #'string-equal))
+
+(defun %origin-key (url)
+  "dexador's pool key for URL: scheme://authority."
+  (let ((uri (quri:uri url)))
+    (format nil "~A://~A" (quri:uri-scheme uri) (quri:uri-authority uri))))
+
+(defun %call-with-connection-pool (pool url take-pooled thunk)
+  "Call THUNK (one dexador call) with POOL as dexador's connection pool.
+   TAKE-POOLED NIL (a non-idempotent method): THUNK starts from an empty pool,
+   so dexador opens a fresh connection, and the connection it keeps goes
+   into POOL afterwards. dexador resends a request once when a reused
+   connection fails, timeouts included, with no method check; a request
+   that never starts on a reused connection is never resent (RFC 9110
+   §9.2.2)."
+  (if take-pooled
+      (let ((dexador:*connection-pool* pool))
+        (funcall thunk))
+      (let ((staging (dexador:make-connection-pool))
+            (origin (%origin-key url)))
+        (unwind-protect
+            (let ((dexador:*connection-pool* staging))
+              (funcall thunk))
+          (loop for stream = (let ((dexador:*connection-pool* staging))
+                               (dexador.connection-cache:steal-connection origin))
+                while stream
+                do (let ((dexador:*connection-pool* pool))
+                     (dexador.connection-cache:push-connection origin stream #'close)))
+          (let ((dexador:*connection-pool* staging))
+            (ignore-errors (dexador:clear-connection-pool)))))))
+
 (defun %call-with-timeouts (thunk &key total read lisp-bio)
   "Run THUNK (one dexador call) under the protocol timeouts dexador does not
    enforce itself (#24), signalling HTTP-TIMEOUT-ERROR.
@@ -291,9 +375,11 @@
           (%dexador-timeouts request client)
         (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read))
                ;; A pooled connection keeps the read timeout (and BIO) it was
-               ;; opened with: a request that needs its own read phase on
-               ;; HTTPS opens a fresh connection and closes it afterwards.
-               (reuse (not lisp-bio)))
+               ;; opened with: take one only from the pool of connections
+               ;; opened the way this request would open one.
+               (pool (%connection-pool
+                      (%pool-key url read-timeout lisp-bio proxy)))
+               (take-pooled (and (%idempotent-method-p method) t)))
           (flet ((finish (body status resp-headers uri)
                    (let* ((final-url (if (typep uri 'quri:uri)
                                          (quri:render-uri uri)
@@ -323,21 +409,24 @@
                   (multiple-value-bind (body status resp-headers uri)
                       (%call-with-timeouts
                        (lambda ()
-                         (%call-dexador
-                          url
-                          :method method
-                          :headers headers
-                          :content content
-                          :cookie-jar cookie-jar
-                          :connect-timeout connect-timeout
-                          :read-timeout read-timeout
-                          :max-redirects (or max-redirects 5)
-                          :proxy proxy
-                          :insecure (not verify)
-                          :force-binary (http-request-force-binary request)
-                          :want-stream (http-request-want-stream request)
-                          :keep-alive reuse
-                          :use-connection-pool reuse))
+                         (%call-with-connection-pool
+                          pool url take-pooled
+                          (lambda ()
+                            (%call-dexador
+                             url
+                             :method method
+                             :headers headers
+                             :content content
+                             :cookie-jar cookie-jar
+                             :connect-timeout connect-timeout
+                             :read-timeout read-timeout
+                             :max-redirects (or max-redirects 5)
+                             :proxy proxy
+                             :insecure (not verify)
+                             :force-binary (http-request-force-binary request)
+                             :want-stream (http-request-want-stream request)
+                             :keep-alive t
+                             :use-connection-pool t))))
                        :total total :read explicit-read :lisp-bio lisp-bio)
                     (finish body status resp-headers uri))
                 (dexador:http-request-failed (e)

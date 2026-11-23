@@ -28,9 +28,7 @@ applied in three parts:
   never fired on HTTPS (#24). A request with its own read phase (`:read` with
   no `:total`, or one shorter than `:total`) therefore uses cl+ssl's Lisp BIO.
   Its TLS reads then go through the fd-stream, and silence longer than `:read`
-  ends the request while a body that keeps arriving is not cut off. Such a
-  request opens a fresh connection and closes it afterwards: a pooled
-  connection keeps the BIO and read timeout it was opened with. The Lisp BIO
+  ends the request while a body that keeps arriving is not cut off. The Lisp BIO
   costs throughput: 20 MB over loopback took 120 ms with it and 15–35 ms
   without.
 
@@ -39,6 +37,34 @@ applied in three parts:
 (let ((*http-backend* (http-backend-dexador:make-dexador-backend)))
   (http:get "https://example.com/" :timeout '(:connect 5 :read 10)))
 ```
+
+## Connection pools
+
+dexador sets a connection's read timeout and BIO only when it opens it, and its
+one pool is keyed by `scheme://authority`. A reused connection therefore kept
+the timeout of the request that opened it: `:read 1` after a default request
+waited out the old 30 s, and a `:timeout 1` request cut later ones short.
+The backend keeps one dexador pool per kind of connection and binds
+`dexador:*connection-pool*` to it for each call:
+
+- plain HTTP: one pool per read timeout (whole seconds);
+- HTTPS over cl+ssl's socket BIO: one pool (that BIO never sees the read
+  timeout; the total deadline bounds those requests);
+- HTTPS over the Lisp BIO: one pool per read timeout;
+- the proxy is part of the key, so a direct request never gets a proxied
+  connection.
+
+At most `*max-connection-pools*` (8) pools are kept; making one more closes
+the idle connections of the least recently used. `(clear-connection-pools)`
+closes every idle connection.
+
+dexador resends a request once on a new connection when a reused one fails,
+read timeouts included, and does not look at the method. POST, PATCH and
+the other non-idempotent methods (RFC 9110 §9.2.2) therefore never start on
+a pooled connection: they open a fresh one, which goes back into the pool
+afterwards. An idempotent request on a reused connection can still be sent
+twice, so a `:read` timeout there can take up to twice `:read` (`:total`
+still caps the call).
 
 ## Test
 
