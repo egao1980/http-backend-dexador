@@ -16,11 +16,12 @@
   :in-order-to ((test-op (test-op "http-backend-dexador/tests"))))
 
 (defsystem "http-backend-dexador/tests"
-  :depends-on ("http-backend-dexador" "rove")
+  :depends-on ("http-backend-dexador" "cl+ssl" "usocket" "bordeaux-threads" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
-               (:file "backend-test"))
+               (:file "backend-test")
+               (:file "proxy-timeout-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
