@@ -3,7 +3,11 @@
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("http-protocol" "dexador" "cl+ssl" "quri")
+  :depends-on ("http-protocol" "dexador"
+               ;; off Windows dexador talks TLS through cl+ssl; the backend binds
+               ;; its *default-unwrap-stream-p* (on Windows dexador uses WinHTTP)
+               (:feature (:not (:or :windows :win32)) "cl+ssl")
+               "quri")
   :properties
   (:cl-repo
    (:ci (:with ("cl-stack-ssl" "http-encoding-chipz")

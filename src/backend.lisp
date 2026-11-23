@@ -87,17 +87,38 @@
                        n)))
             (values decoded ht))))))))
 
-(defun %call-dexador (&rest args)
-  (if *dexador-request-fn*
-      (apply *dexador-request-fn* args)
-      (apply #'dexador:request args)))
+(defun %call-dexador (url &rest args &key proxy &allow-other-keys)
+  (declare (ignorable proxy))
+  (cond
+   (*dexador-request-fn*
+    (apply *dexador-request-fn* url args))
+   #+(or windows win32)
+   (proxy
+    ;; dexador 0.9.16's WinHTTP backend ignores :proxy and opens its session
+    ;; with WINHTTP_ACCESS_TYPE_NO_PROXY: going direct would bypass the proxy
+    ;; the caller (or the system) configured (#23).
+    (error 'unsupported-operation
+           :operation :proxy
+           :message (format nil "http-backend-dexador: dexador's WinHTTP backend cannot use a proxy (~A); use http-backend-winhttp or http-backend-async" proxy)))
+   (t
+    (apply #'dexador:request url args))))
+
+(defun %winhttp-timeout-p (condition)
+  "True for the winhttp WIN-ERROR with ERROR_WINHTTP_TIMEOUT (12002): on
+   Windows dexador runs over WinHTTP, whose receive timeout ends in that."
+  (let* ((pkg (find-package :winhttp))
+         (type (and pkg (find-symbol "WIN-ERROR" pkg)))
+         (code (and pkg (find-symbol "WIN-ERROR-CODE" pkg))))
+    (and type code (find-class type nil) (typep condition type) (fboundp code)
+         (eql 12002 (funcall code condition)))))
 
 (defun %timeout-error-p (condition)
-  "Dexador/usocket/OS timeout types are not a single CLOS class."
+  "Dexador/usocket/OS/WinHTTP timeout types are not a single CLOS class."
   (let ((type (type-of condition)))
     (or (typep condition 'http-timeout-error)
         (and (symbolp type)
-             (search "TIMEOUT" (symbol-name type) :test #'char-equal)))))
+             (search "TIMEOUT" (symbol-name type) :test #'char-equal))
+        (%winhttp-timeout-p condition))))
 
 (defun %dexador-seconds (seconds)
   "Whole seconds for dexador (>= 1 when a deadline is set).
@@ -110,19 +131,23 @@
   "Map protocol HTTP-TIMEOUT onto dexador. → (values CONNECT READ TOTAL EXPLICIT-READ)
 
    CONNECT / READ: whole seconds for dexador's :connect-timeout /
-   :read-timeout (each falls back to TOTAL, then 10 s). Previously only
-   NUMBER timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL meant no deadline
-   and SEND could hang (keep-alive reuse, fat PDFs).
+   :read-timeout (each falls back to TOTAL, then 10 s; neither exceeds
+   TOTAL, which is all WinHTTP gets on Windows). Previously only NUMBER
+   timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL meant no deadline and
+   SEND could hang (keep-alive reuse, fat PDFs).
    TOTAL: seconds the backend caps the whole attempt at (#24), or NIL.
    EXPLICIT-READ: the caller's READ phase in seconds when TOTAL does not
    already bound it (no TOTAL, or a longer one), else NIL."
   (let* ((timeout (effective-timeout request client))
          (read (timeout-read timeout))
-         (total (timeout-total timeout)))
-    (values (%dexador-seconds (timeout-connect-seconds timeout))
-            (%dexador-seconds (timeout-read-seconds timeout))
-            (and total (plusp total) total)
-            (and read (plusp read) (or (null total) (< read total)) read))))
+         (total (timeout-total timeout))
+         (total (and total (plusp total) total)))
+    (flet ((capped (seconds)
+             (%dexador-seconds (if total (min seconds total) seconds))))
+      (values (capped (timeout-connect-seconds timeout))
+              (capped (timeout-read-seconds timeout))
+              total
+              (and read (plusp read) (or (null total) (< read total)) read)))))
 
 (defun %https-url-p (url)
   (string-equal "https" (quri:uri-scheme (quri:uri url))))
@@ -130,7 +155,11 @@
 (defun %lisp-bio-failure-p (condition)
   "True for the ssl-error cl+ssl's Lisp BIO reports when a read or write on
    the socket stream failed, a timeout included: the BIO catches the Lisp
-   condition and leaves only its own source file in the OpenSSL error queue."
+   condition and leaves only its own source file in the OpenSSL error queue.
+   Never on Windows, where dexador runs over WinHTTP, not cl+ssl."
+  #+(or windows win32) (declare (ignore condition))
+  #+(or windows win32) nil
+  #-(or windows win32)
   (and (typep condition 'cl+ssl::ssl-error)
        (search "bio.lisp" (ignore-errors (princ-to-string condition)))
        t))
@@ -146,13 +175,22 @@
   #-sbcl
   (progn seconds (funcall thunk)))
 
+(defun %needs-lisp-bio-p (url explicit-read)
+  "True for an HTTPS request with its own read phase (see %CALL-WITH-TIMEOUTS).
+   Never on Windows: dexador runs over WinHTTP there, whose receive timeout
+   holds for HTTPS too."
+  #+(or windows win32) (declare (ignore url explicit-read))
+  #+(or windows win32) nil
+  #-(or windows win32) (and explicit-read (%https-url-p url) t))
+
 (defun %call-with-timeouts (thunk &key total read lisp-bio)
   "Run THUNK (one dexador call) under the protocol timeouts dexador does not
    enforce itself (#24), signalling HTTP-TIMEOUT-ERROR.
 
-   TOTAL caps the attempt with a deadline. READ (an explicit read phase TOTAL
-   does not cover) matters for HTTPS only: dexador puts its :read-timeout on
-   the socket's fd-stream, but cl+ssl's default socket BIO reads the raw
+   TOTAL caps the attempt with a deadline (SBCL, off Windows: WinHTTP's
+   blocking calls do not check it). READ (an explicit read phase TOTAL does
+   not cover) matters for HTTPS only: dexador puts its :read-timeout on the
+   socket's fd-stream, but cl+ssl's default socket BIO reads the raw
    descriptor, so the timeout never fired. LISP-BIO (set for those requests)
    makes cl+ssl read through the fd-stream, so silence longer than READ ends
    the read as it does for plain HTTP. The BIO reports that as a generic
@@ -175,9 +213,12 @@
                         ((and read (>= secs (* 0.95 read)))
                          (timeout "read" read))))))))
         (handler-case
-            (let ((cl+ssl:*default-unwrap-stream-p*
-                   (if lisp-bio nil cl+ssl:*default-unwrap-stream-p*)))
-              (%call-with-deadline total thunk))
+            #-(or windows win32)
+          (let ((cl+ssl:*default-unwrap-stream-p*
+                 (if lisp-bio nil cl+ssl:*default-unwrap-stream-p*)))
+            (%call-with-deadline total thunk))
+          #+(or windows win32)
+          (%call-with-deadline total thunk)
           #+sbcl
           (sb-sys:deadline-timeout ()
             (timeout "total" total)))))))
@@ -248,7 +289,7 @@
                "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
       (multiple-value-bind (connect-timeout read-timeout total explicit-read)
           (%dexador-timeouts request client)
-        (let* ((lisp-bio (and explicit-read (%https-url-p url)))
+        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read))
                ;; A pooled connection keeps the read timeout (and BIO) it was
                ;; opened with: a request that needs its own read phase on
                ;; HTTPS opens a fresh connection and closes it afterwards.
