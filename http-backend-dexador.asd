@@ -1,9 +1,9 @@
 (defsystem "http-backend-dexador"
-  :version "0.1.5"
+  :version "0.2.0"
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("http-protocol" "dexador" "quri")
+  :depends-on ("http-protocol" "dexador" "cl+ssl" "quri")
   :properties
   (:cl-repo
    (:ci (:with ("cl-stack-ssl" "http-encoding-chipz")
@@ -21,7 +21,8 @@
   :serial t
   :components ((:file "package")
                (:file "backend-test")
-               (:file "proxy-timeout-test"))
+               (:file "proxy-timeout-test")
+               (:file "timeout-proxy-edge-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

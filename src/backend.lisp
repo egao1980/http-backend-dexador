@@ -13,12 +13,19 @@
   (declare (ignore backend))
   '(:http/1.1))
 
+(defun %soft-load-content-codings ()
+  "Soft-load the optional Content-Encoding backends through http-protocol's
+   cached probe: CONTENT-CODING-SUPPORTED-P loads a coding's system once and
+   caches a miss. A backend is made per facade request (cl-stack-http
+   ENSURE-HTTP-BACKEND); an ASDF:LOAD-SYSTEM per coding per call re-planned
+   four trees each time and warned about recursive ASDF use inside an
+   operation (#26)."
+  (dolist (coding '(:gzip :br :zstd :snappy))
+    (ignore-errors (content-coding-supported-p coding))))
+
 (defun make-dexador-backend ()
-  "Return a DEXADOR-BACKEND. Content encodings are soft-loaded."
-  (ignore-errors (asdf:load-system "http-encoding-chipz"))
-  (ignore-errors (asdf:load-system "http-encoding-brotli"))
-  (ignore-errors (asdf:load-system "http-encoding-zstd"))
-  (ignore-errors (asdf:load-system "http-encoding-snappy"))
+  "Return a DEXADOR-BACKEND. Content encodings are soft-loaded, once per image."
+  (%soft-load-content-codings)
   (make-instance 'dexador-backend))
 
 (defvar *dexador-request-fn* nil
@@ -100,12 +107,105 @@
   (and seconds (max 1 (ceiling seconds))))
 
 (defun %dexador-timeouts (request client)
-  "Map protocol HTTP-TIMEOUT onto dexador :connect-timeout / :read-timeout.
-   Previously only NUMBER timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL
-   meant no deadline and SEND could hang (keep-alive reuse, fat PDFs)."
-  (let ((timeout (effective-timeout request client)))
+  "Map protocol HTTP-TIMEOUT onto dexador. → (values CONNECT READ TOTAL EXPLICIT-READ)
+
+   CONNECT / READ: whole seconds for dexador's :connect-timeout /
+   :read-timeout (each falls back to TOTAL, then 10 s). Previously only
+   NUMBER timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL meant no deadline
+   and SEND could hang (keep-alive reuse, fat PDFs).
+   TOTAL: seconds the backend caps the whole attempt at (#24), or NIL.
+   EXPLICIT-READ: the caller's READ phase in seconds when TOTAL does not
+   already bound it (no TOTAL, or a longer one), else NIL."
+  (let* ((timeout (effective-timeout request client))
+         (read (timeout-read timeout))
+         (total (timeout-total timeout)))
     (values (%dexador-seconds (timeout-connect-seconds timeout))
-            (%dexador-seconds (timeout-read-seconds timeout)))))
+            (%dexador-seconds (timeout-read-seconds timeout))
+            (and total (plusp total) total)
+            (and read (plusp read) (or (null total) (< read total)) read))))
+
+(defun %https-url-p (url)
+  (string-equal "https" (quri:uri-scheme (quri:uri url))))
+
+(defun %lisp-bio-failure-p (condition)
+  "True for the ssl-error cl+ssl's Lisp BIO reports when a read or write on
+   the socket stream failed, a timeout included: the BIO catches the Lisp
+   condition and leaves only its own source file in the OpenSSL error queue."
+  (and (typep condition 'cl+ssl::ssl-error)
+       (search "bio.lisp" (ignore-errors (princ-to-string condition)))
+       t))
+
+(defun %call-with-deadline (seconds thunk)
+  "Call THUNK under an SBCL deadline of SECONDS (NIL: no deadline). Every
+   blocking socket wait checks it: plain fd-streams, cl+ssl's socket BIO and
+   connect. Elsewhere THUNK runs without one."
+  #+sbcl
+  (if seconds
+      (sb-sys:with-deadline (:seconds seconds) (funcall thunk))
+      (funcall thunk))
+  #-sbcl
+  (progn seconds (funcall thunk)))
+
+(defun %call-with-timeouts (thunk &key total read lisp-bio)
+  "Run THUNK (one dexador call) under the protocol timeouts dexador does not
+   enforce itself (#24), signalling HTTP-TIMEOUT-ERROR.
+
+   TOTAL caps the attempt with a deadline. READ (an explicit read phase TOTAL
+   does not cover) matters for HTTPS only: dexador puts its :read-timeout on
+   the socket's fd-stream, but cl+ssl's default socket BIO reads the raw
+   descriptor, so the timeout never fired. LISP-BIO (set for those requests)
+   makes cl+ssl read through the fd-stream, so silence longer than READ ends
+   the read as it does for plain HTTP. The BIO reports that as a generic
+   ssl-error; one that comes after READ (or TOTAL) seconds is the timeout."
+  (let ((start (get-internal-real-time)))
+    (flet ((elapsed ()
+             (/ (- (get-internal-real-time) start)
+                (float internal-time-units-per-second 1d0)))
+           (timeout (phase seconds)
+             (error 'http-timeout-error
+                    :message (format nil "dexador: ~A timeout after ~,1F s"
+                                     phase seconds))))
+      (handler-bind
+          ((error
+            (lambda (c)
+              (when (and lisp-bio (%lisp-bio-failure-p c))
+                (let ((secs (elapsed)))
+                  (cond ((and total (>= secs (* 0.95 total)))
+                         (timeout "total" total))
+                        ((and read (>= secs (* 0.95 read)))
+                         (timeout "read" read))))))))
+        (handler-case
+            (let ((cl+ssl:*default-unwrap-stream-p*
+                   (if lisp-bio nil cl+ssl:*default-unwrap-stream-p*)))
+              (%call-with-deadline total thunk))
+          #+sbcl
+          (sb-sys:deadline-timeout ()
+            (timeout "total" total)))))))
+
+(defun %dexador-proxy (request client url)
+  "The proxy URL dexador gets for URL, or NIL for a direct connection (#23).
+   The protocol proxy (request :proxy over the client's, else the system
+   default) is an HTTP-PROXY-CONFIG; dexador takes a URL string. SOCKS goes
+   out as socks5:// (dexador's SOCKS5 sends the host name, no auth)."
+  (let ((proxy (resolve-proxy (effective-proxy-config request client) url)))
+    (when proxy
+      (let ((proxy (if (stringp proxy) proxy (princ-to-string proxy))))
+        (case (proxy-kind proxy)
+          (:socks5
+           (let ((u (quri:uri proxy)))
+             (when (quri:uri-userinfo u)
+               (error 'unsupported-operation
+                      :operation :socks5-auth
+                      :message "http-backend-dexador: dexador's SOCKS5 has no authentication; use http-backend-async"))
+             (quri:render-uri
+              (quri:make-uri :scheme "socks5"
+                             :host (quri:uri-host u)
+                             :port (quri:uri-port u)))))
+          (:socks4
+           (error 'unsupported-operation
+                  :operation :socks4-proxy
+                  :message (format nil "http-backend-dexador: dexador has no SOCKS4 (~A); use http-backend-async" proxy)))
+          (t proxy))))))
 
 (defmethod send ((backend dexador-backend) client request &key)
   ;; Dexador is HTTP/1.1 only — refuse forced HTTP/2 up front.
@@ -120,7 +220,7 @@
          (ae (%accept-encoding-header (http-request-accept-encoding request)))
          (max-redirects (or (http-request-max-redirects request)
                             (http-client-max-redirects client)))
-         (proxy (http-client-proxy client))
+         (proxy (%dexador-proxy request client url))
          (verify (http-client-verify client))
          (cookie-jar (resolve-cookie-jar client request :url url)))
     (setf headers (inject-auth-range-headers
@@ -146,55 +246,64 @@
                :operation :stream-body
                :message
                "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
-      (multiple-value-bind (connect-timeout read-timeout)
+      (multiple-value-bind (connect-timeout read-timeout total explicit-read)
           (%dexador-timeouts request client)
-        (flet ((finish (body status resp-headers uri)
-                 (let* ((final-url (if (typep uri 'quri:uri)
-                                       (quri:render-uri uri)
-                                       (if uri (princ-to-string uri) url)))
-                        (set-cookies (merge-response-cookies
-                                      cookie-jar final-url resp-headers)))
-                   (multiple-value-bind (body* headers*)
-                       (apply-response-content-encoding
-                        body resp-headers
-                        :decompress (http-request-decompress request))
-                     (make-instance 'http-response
-                                    :status status
-                                    :headers headers*
-                                    :body body*
-                                    :url final-url
-                                    :cookies set-cookies
-                                    :http-version :http/1.1
-                                    :request request)))))
-          (handler-bind
-              ((error
-                (lambda (c)
-                  (when (and (%timeout-error-p c)
-                             (not (typep c 'http-timeout-error)))
-                    (error 'http-timeout-error
-                           :message (princ-to-string c))))))
-            (handler-case
-                (multiple-value-bind (body status resp-headers uri)
-                    (%call-dexador
-                     url
-                     :method method
-                     :headers headers
-                     :content content
-                     :cookie-jar cookie-jar
-                     :connect-timeout connect-timeout
-                     :read-timeout read-timeout
-                     :max-redirects (or max-redirects 5)
-                     :proxy proxy
-                     :insecure (not verify)
-                     :force-binary (http-request-force-binary request)
-                     :want-stream (http-request-want-stream request)
-                     :keep-alive t)
-                  (finish body status resp-headers uri))
-              (dexador:http-request-failed (e)
-                (let ((res (finish (dexador:response-body e)
-                                   (dexador:response-status e)
-                                   (dexador:response-headers e)
-                                   (dexador:request-uri e))))
-                  (if (http-request-raise-for-status request)
-                      (raise-for-status res)
-                      res))))))))))
+        (let* ((lisp-bio (and explicit-read (%https-url-p url)))
+               ;; A pooled connection keeps the read timeout (and BIO) it was
+               ;; opened with: a request that needs its own read phase on
+               ;; HTTPS opens a fresh connection and closes it afterwards.
+               (reuse (not lisp-bio)))
+          (flet ((finish (body status resp-headers uri)
+                   (let* ((final-url (if (typep uri 'quri:uri)
+                                         (quri:render-uri uri)
+                                         (if uri (princ-to-string uri) url)))
+                          (set-cookies (merge-response-cookies
+                                        cookie-jar final-url resp-headers)))
+                     (multiple-value-bind (body* headers*)
+                         (apply-response-content-encoding
+                          body resp-headers
+                          :decompress (http-request-decompress request))
+                       (make-instance 'http-response
+                                      :status status
+                                      :headers headers*
+                                      :body body*
+                                      :url final-url
+                                      :cookies set-cookies
+                                      :http-version :http/1.1
+                                      :request request)))))
+            (handler-bind
+                ((error
+                  (lambda (c)
+                    (when (and (%timeout-error-p c)
+                               (not (typep c 'http-timeout-error)))
+                      (error 'http-timeout-error
+                             :message (princ-to-string c))))))
+              (handler-case
+                  (multiple-value-bind (body status resp-headers uri)
+                      (%call-with-timeouts
+                       (lambda ()
+                         (%call-dexador
+                          url
+                          :method method
+                          :headers headers
+                          :content content
+                          :cookie-jar cookie-jar
+                          :connect-timeout connect-timeout
+                          :read-timeout read-timeout
+                          :max-redirects (or max-redirects 5)
+                          :proxy proxy
+                          :insecure (not verify)
+                          :force-binary (http-request-force-binary request)
+                          :want-stream (http-request-want-stream request)
+                          :keep-alive reuse
+                          :use-connection-pool reuse))
+                       :total total :read explicit-read :lisp-bio lisp-bio)
+                    (finish body status resp-headers uri))
+                (dexador:http-request-failed (e)
+                  (let ((res (finish (dexador:response-body e)
+                                     (dexador:response-status e)
+                                     (dexador:response-headers e)
+                                     (dexador:request-uri e))))
+                    (if (http-request-raise-for-status request)
+                        (raise-for-status res)
+                        res)))))))))))
