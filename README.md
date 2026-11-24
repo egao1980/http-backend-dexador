@@ -9,7 +9,7 @@ MIT. Sync [`http-protocol`](https://github.com/egao1980/http-protocol) backend o
 | Request CE | Opt-in `:content-encoding` |
 | Bodies | `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` (streams → async) |
 | Timeouts | See below. Every phase failure is an `http-timeout-error`. |
-| Proxy | `effective-proxy-config` (request `:proxy`, then the client's, then the system default) → `resolve-proxy` for the URL → dexador `:proxy` URL, or NIL for direct. Plain HTTP through an HTTP proxy goes out in absolute-form (`GET http://host/path`, RFC 9112 §3.2.2), which needs dexador ≥ 0.9.16.1 (the egao1980/dexador fork; 0.9.16 sent the origin-form and squid answered 400). HTTPS goes through `CONNECT`. `no_proxy` is honoured. SOCKS5 / `socks5h` go out as `socks5://`. SOCKS4 and SOCKS5 with credentials signal `unsupported-operation`, because dexador has neither: use `http-backend-async`. |
+| Proxy | `effective-proxy-config` (request `:proxy`, then the client's, then the system default) → `resolve-proxy` for the URL → dexador `:proxy` URL, or NIL for direct. Plain HTTP through an HTTP proxy goes out in absolute-form (`GET http://host/path`, RFC 9112 §3.2.2), which needs dexador ≥ 0.9.16.1 (the egao1980/dexador fork; 0.9.16 sent the origin-form and squid answered 400). With an older dexador such a request signals `unsupported-operation` instead. HTTPS goes through `CONNECT`. `no_proxy` is honoured. SOCKS5 / `socks5h` go out as `socks5://`. SOCKS4 and SOCKS5 with credentials signal `unsupported-operation`, because dexador has neither: use `http-backend-async`. |
 | 4xx/5xx | Returned as `http-response` (httpx style); `:raise-for-status t` to signal |
 
 ## Timeouts

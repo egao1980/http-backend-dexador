@@ -5,6 +5,22 @@
 
 (in-package #:http-backend-dexador/tests)
 
+(deftest dexador-version-guard
+  (ok http-backend-dexador::*dexador-absolute-form*
+      "the loaded dexador is 0.9.16.1 or later (absolute-form to an HTTP proxy)")
+  (testing "an older dexador refuses plain HTTP through an HTTP proxy instead of sending the origin-form"
+    (let* ((http-backend-dexador::*dexador-absolute-form* nil)
+           (backend (make-dexador-backend))
+           (client (make-http-client
+                    backend
+                    :proxy (make-http-proxy-config :proxy "http://127.0.0.1:9" :system nil))))
+      (ok (signals (send backend client (make-http-request :url "http://origin.test/" :timeout 2))
+            'unsupported-operation))
+      (let ((proxy (http-backend-dexador::%dexador-proxy
+                    (make-http-request :url "https://origin.test/") client "https://origin.test/")))
+        (ok (and (stringp proxy) (search "127.0.0.1:9" proxy))
+            (format nil "HTTPS still goes through CONNECT (proxy ~S)" proxy))))))
+
 (deftest forward-proxy-live
   (let ((proxy (uiop:getenv "HTTP_BACKEND_DEXADOR_LIVE_PROXY")))
     (if (or (null proxy) (string= proxy ""))

@@ -425,11 +425,22 @@
           (sb-sys:deadline-timeout ()
             (timeout "total" total)))))))
 
+(defvar *dexador-absolute-form*
+  (let ((system (asdf:find-system "dexador" nil)))
+    (and system (asdf:version-satisfies system "0.9.16.1") t))
+  "True when the loaded dexador sends a plain-HTTP request to an HTTP proxy in
+   absolute-form (RFC 9112 §3.2.2): 0.9.16.1 and later, published from the
+   egao1980/dexador fork. 0.9.16 sent the origin-form, which forward proxies
+   such as squid answer with 400. The .asd cannot require the version yet
+   (cl-repository#171), so an older dexador is refused here for those
+   requests instead of failing at the proxy.")
+
 (defun %dexador-proxy (request client url)
   "The proxy URL dexador gets for URL, or NIL for a direct connection (#23).
    The protocol proxy (request :proxy over the client's, else the system
    default) is an HTTP-PROXY-CONFIG; dexador takes a URL string. SOCKS goes
-   out as socks5:// (dexador's SOCKS5 sends the host name, no auth)."
+   out as socks5:// (dexador's SOCKS5 sends the host name, no auth). A
+   plain-HTTP URL through an HTTP proxy needs *DEXADOR-ABSOLUTE-FORM*."
   (let ((proxy (resolve-proxy (effective-proxy-config request client) url)))
     (when proxy
       (let ((proxy (if (stringp proxy) proxy (princ-to-string proxy))))
@@ -448,7 +459,15 @@
            (error 'unsupported-operation
                   :operation :socks4-proxy
                   :message (format nil "http-backend-dexador: dexador has no SOCKS4 (~A); use http-backend-async" proxy)))
-          (t proxy))))))
+          (t
+           (when (and (not *dexador-absolute-form*)
+                      (null *dexador-request-fn*)
+                      (not (%https-url-p url)))
+             (error 'unsupported-operation
+                    :operation :http-proxy-origin-form
+                    :message (format nil "http-backend-dexador: this dexador (older than 0.9.16.1) would send ~A to the proxy ~A in origin-form, which forward proxies reject; update dexador, or use http-backend-async"
+                                     url proxy)))
+           proxy))))))
 
 (defmethod send ((backend dexador-backend) client request &key)
   ;; Dexador is HTTP/1.1 only — refuse forced HTTP/2 up front.
