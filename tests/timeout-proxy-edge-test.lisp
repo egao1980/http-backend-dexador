@@ -215,15 +215,18 @@
         (ok (typep res 'unsupported-operation)
             (format nil "Windows: dexador's WinHTTP backend has no proxy support, so a configured proxy is an error, not a silent bypass (got ~A)" res))
         #-(or windows win32)
-        (progn
-          (ok (typep res 'http-response) (format nil "got ~A" res))
-          ;; It reached the proxy, which origin.test (no DNS) could not
-          ;; without it. The request line's absolute-form (dexador 0.9.16.1)
-          ;; is checked by plain-http-proxy-request-is-absolute-form.
-          (ok (and (car head)
-                   (search "/path?q=1 HTTP/1.1" (car head))
-                   (search "Host: origin.test" (car head)))
-              (format nil "proxy saw ~S" (car head))))))))
+        (if http-backend-dexador::*dexador-absolute-form*
+            (progn
+              (ok (typep res 'http-response) (format nil "got ~A" res))
+              ;; It reached the proxy, which origin.test (no DNS) could not
+              ;; without it. The request line's absolute-form (dexador 0.9.16.1)
+              ;; is checked by plain-http-proxy-request-is-absolute-form.
+              (ok (and (car head)
+                       (search "/path?q=1 HTTP/1.1" (car head))
+                       (search "Host: origin.test" (car head)))
+                  (format nil "proxy saw ~S" (car head))))
+            (ok (typep res 'unsupported-operation)
+                (format nil "dexador older than 0.9.16.1: refused, not sent in origin-form (got ~A)" res)))))))
 
 (deftest socks-proxy-shapes
   (flet ((seen (proxy)

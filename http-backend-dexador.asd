@@ -4,10 +4,11 @@
   :author "egao1980"
   :license "MIT"
   :depends-on ("http-protocol"
-               ;; Needs dexador 0.9.16.1 (egao1980/dexador fork: absolute-form to an
+               ;; Wants dexador 0.9.16.1 (egao1980/dexador fork: absolute-form to an
                ;; HTTP proxy, #23). (:version "dexador" "0.9.16.1") makes cl-repo pull
-               ;; uiop:3.1.1 and fail (cl-repository#171); the backend checks the
-               ;; loaded version instead (*dexador-absolute-form*).
+               ;; uiop:3.1.1 and fail (cl-repository#171), and a client image keeps
+               ;; its own 0.9.16 (#172); the backend checks the loaded version
+               ;; instead (*dexador-absolute-form*).
                "dexador"
                "bordeaux-threads" "trivial-gray-streams"
                ;; off Windows dexador talks TLS through cl+ssl; the backend binds

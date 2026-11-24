@@ -24,8 +24,18 @@
                             (make-http-request :url "http://origin.test/path?q=1" :timeout 5))
                     (error (e) e))))
         (%finish-server port thread)
-        (ok (typep res 'http-response) (format nil "got ~A" res))
         (let* ((h (car head))
                (line (and h (subseq h 0 (position #\Return h)))))
-          (ok (equal "GET http://origin.test/path?q=1 HTTP/1.1" line)
-              (format nil "request line the proxy saw: ~S" line)))))))
+          (if http-backend-dexador::*dexador-absolute-form*
+              (progn
+                (ok (typep res 'http-response) (format nil "got ~A" res))
+                (ok (equal "GET http://origin.test/path?q=1 HTTP/1.1" line)
+                    (format nil "request line the proxy saw: ~S" line)))
+              ;; Defense, round 3: a dexador older than 0.9.16.1 (on CI the
+              ;; cl-repository client's own copy, cl-repository#172) cannot
+              ;; write the absolute-form, so the request is refused before it
+              ;; reaches the proxy, never sent in origin-form.
+              (progn
+                (ok (typep res 'unsupported-operation)
+                    (format nil "dexador older than 0.9.16.1: got ~A" res))
+                (ok (null line) (format nil "the proxy saw nothing: ~S" line)))))))))

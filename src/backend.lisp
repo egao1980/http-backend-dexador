@@ -431,9 +431,11 @@
   "True when the loaded dexador sends a plain-HTTP request to an HTTP proxy in
    absolute-form (RFC 9112 §3.2.2): 0.9.16.1 and later, published from the
    egao1980/dexador fork. 0.9.16 sent the origin-form, which forward proxies
-   such as squid answer with 400. The .asd cannot require the version yet
-   (cl-repository#171), so an older dexador is refused here for those
-   requests instead of failing at the proxy.")
+   such as squid answer with 400. An older one is refused for those requests
+   (unsupported-operation) instead of failing at the proxy. It still turns
+   up: an image that runs the cl-repository client loads the client's own
+   dexador 0.9.16 (cl-repository#172), and the .asd cannot require 0.9.16.1
+   yet (cl-repository#171).")
 
 (defun %dexador-proxy (request client url)
   "The proxy URL dexador gets for URL, or NIL for a direct connection (#23).
