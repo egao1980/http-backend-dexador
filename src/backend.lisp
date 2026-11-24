@@ -87,7 +87,76 @@
                        n)))
             (values decoded ht))))))))
 
+(defvar *total-watchdog* nil
+  "Windows, while %CALL-WITH-TIMEOUTS runs an attempt that has a TOTAL: a
+   function of one thunk, a dexador call, that runs it in a thread of its own
+   and gives up on it when what is left of TOTAL runs out
+   (%CALL-WITH-WATCHDOG). %CALL-DEXADOR sends each real dexador call through
+   it. NIL otherwise.")
+
+(defparameter +dexador-specials+
+  '(dexador:*dexador-backend* dexador:*connection-pool* dexador:*use-connection-pool*
+    dexador:*default-connect-timeout* dexador:*default-read-timeout*
+    dexador:*default-proxy* dexador:*verbose* dexador:*not-verify-ssl*)
+  "dexador's specials. A dexador call made in another thread gets them bound
+   as they are in the thread that made it: a new thread sees global values
+   only.")
+
+(defun %call-with-watchdog (seconds thunk on-timeout)
+  "Call THUNK in a thread of its own and wait for it at most SECONDS.
+   → THUNK's values; a serious condition it signals is signalled again in
+   this thread. When SECONDS run out first, or are not positive, → the
+   values of ON-TIMEOUT, called in this thread, and THUNK is left to end on
+   its own: whatever it returns or signals then is dropped.
+
+   This is how TOTAL holds on Windows (#29). dexador runs over WinHTTP
+   there, in blocking calls that no SBCL deadline reaches, on a request
+   handle dexador keeps to itself; WinHTTP's documentation also rules out
+   closing a synchronous request's handle from another thread. WinHTTP's own
+   timeouts bound one phase each and are checked late: on windows-latest a
+   1 s receive timeout ended a call to a silent server after 1.3 s to more
+   than 4 s."
+  (if (not (plusp seconds))
+      (funcall on-timeout)
+      (let ((done (bt:make-semaphore :name "http-backend-dexador call"))
+            (outcome nil))
+        (bt:make-thread
+         (lambda ()
+           (setf outcome
+                 (handler-case (cons :values (multiple-value-list (funcall thunk)))
+                   (serious-condition (c) (cons :condition c))))
+           (bt:signal-semaphore done))
+         :name "http-backend-dexador call")
+        (cond ((not (bt:wait-on-semaphore done :timeout seconds))
+               (funcall on-timeout))
+              ((eq :condition (car outcome))
+               (error (cdr outcome)))
+              (t
+               (values-list (cdr outcome)))))))
+
+(defun %detached-dexador-call (function url args)
+  "A thunk that applies FUNCTION (DEXADOR:REQUEST) to URL and ARGS, made to
+   run in another thread for a call SEND may give up on. dexador's specials
+   are bound there to their values here (+DEXADOR-SPECIALS+), and the
+   :COOKIE-JAR is a copy: dexador reads and merges the jar destructively
+   (cl-cookie), so a call still running after a timeout must not share the
+   caller's jar. Nothing is lost: SEND merges each response's cookies into
+   the caller's jar itself (MERGE-RESPONSE-COOKIES)."
+  (let ((jar (getf args :cookie-jar))
+        (bound (mapcar #'symbol-value +dexador-specials+)))
+    (when jar
+      (setf args (copy-list args)
+            (getf args :cookie-jar)
+            (cl-cookie:make-cookie-jar
+             :cookies (copy-list (cl-cookie:cookie-jar-cookies jar)))))
+    (lambda ()
+      (progv +dexador-specials+ bound
+        (apply function url args)))))
+
 (defun %call-dexador (url &rest args &key proxy &allow-other-keys)
+  "One dexador request: *DEXADOR-REQUEST-FN* (tests), else DEXADOR:REQUEST.
+   On Windows a proxy is refused (#23), and a call under a TOTAL goes
+   through *TOTAL-WATCHDOG* in a thread of its own (%DETACHED-DEXADOR-CALL)."
   (declare (ignorable proxy))
   (cond
    (*dexador-request-fn*
@@ -100,6 +169,9 @@
     (error 'unsupported-operation
            :operation :proxy
            :message (format nil "http-backend-dexador: dexador's WinHTTP backend cannot use a proxy (~A); use http-backend-winhttp or http-backend-async" proxy)))
+   #+(or windows win32)
+   (*total-watchdog*
+    (funcall *total-watchdog* (%detached-dexador-call #'dexador:request url args)))
    (t
     (apply #'dexador:request url args))))
 
@@ -141,11 +213,12 @@
   "Map protocol HTTP-TIMEOUT onto dexador. → (values CONNECT READ TOTAL EXPLICIT-READ)
 
    CONNECT / READ: seconds for dexador's :connect-timeout / :read-timeout
-   (each falls back to TOTAL, then 10 s; neither exceeds TOTAL, which is all
-   WinHTTP gets on Windows). CONNECT is in whole seconds; READ is exact on
-   SBCL off Windows (see %DEXADOR-READ-SECONDS). Previously only NUMBER
-   timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL meant no deadline and
-   SEND could hang (keep-alive reuse, fat PDFs).
+   (each falls back to TOTAL, then 10 s, and neither exceeds TOTAL). On
+   Windows they are WinHTTP's own timeouts, which also end a call SEND gave
+   up on at TOTAL (%CALL-WITH-WATCHDOG). CONNECT is in whole seconds; READ
+   is exact on SBCL off Windows (see %DEXADOR-READ-SECONDS). Previously only
+   NUMBER timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL meant no
+   deadline and SEND could hang (keep-alive reuse, fat PDFs).
    TOTAL: seconds the backend caps the whole attempt at (#24), or NIL.
    EXPLICIT-READ: the caller's READ phase in seconds when TOTAL does not
    already bound it (no TOTAL, or a longer one), else NIL."
@@ -396,12 +469,16 @@
       body))
 
 (defun %call-with-timeouts (thunk &key total read lisp-bio)
-  "Run THUNK (one dexador call) under the protocol timeouts dexador does not
-   enforce itself (#24), signalling HTTP-TIMEOUT-ERROR.
+  "Run THUNK (one attempt: a request and the redirects it follows) under the
+   protocol timeouts dexador does not enforce itself (#24, #29), signalling
+   HTTP-TIMEOUT-ERROR.
 
-   TOTAL caps the attempt with a deadline (SBCL, off Windows: WinHTTP's
-   blocking calls do not check it). READ (an explicit read phase TOTAL does
-   not cover) matters for HTTPS only: dexador puts its :read-timeout on the
+   TOTAL caps the attempt. Off Windows (SBCL) that is a deadline, which
+   every socket wait checks. On Windows dexador runs over WinHTTP, whose
+   blocking calls no deadline reaches: each dexador call goes through
+   *TOTAL-WATCHDOG*, so SEND waits for it no longer than what is left of
+   TOTAL (%CALL-WITH-WATCHDOG). READ (an explicit read phase TOTAL does not
+   cover) matters for HTTPS only: dexador puts its :read-timeout on the
    socket's fd-stream, but cl+ssl's default socket BIO reads the raw
    descriptor, so the timeout never fired. LISP-BIO (set for those requests)
    makes cl+ssl read through the fd-stream, so silence longer than READ ends
@@ -430,7 +507,12 @@
                  (if lisp-bio nil cl+ssl:*default-unwrap-stream-p*)))
             (%call-with-deadline total thunk))
           #+(or windows win32)
-          (%call-with-deadline total thunk)
+          (let ((*total-watchdog*
+                 (and total
+                      (lambda (call)
+                        (%call-with-watchdog (- total (elapsed)) call
+                                             (lambda () (timeout "total" total)))))))
+            (%call-with-deadline total thunk))
           #+sbcl
           (sb-sys:deadline-timeout ()
             (timeout "total" total)))))))

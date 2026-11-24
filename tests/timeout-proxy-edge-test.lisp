@@ -66,9 +66,6 @@
                 (error (e) e))))
     (values res (%seconds-since start))))
 
-(defparameter +winhttp-no-total+
-  "Windows: dexador runs over WinHTTP, which has per-phase timeouts only; its blocking calls do not check the SBCL deadline, so a body that keeps arriving is not cut at TOTAL")
-
 ;;; #24 — which requests take the Lisp BIO / a fresh connection
 
 (deftest explicit-read-phase-decision
@@ -167,8 +164,8 @@
           (ok (equalp (%bytes "dddddd") (response-body res))))))))
 
 (deftest https-total-deadline-fires
-  #+(or windows win32) (skip +winhttp-no-total+)
-  #-(or windows win32)
+  ;; Windows too: WinHTTP's blocking calls see no deadline, and SEND waits
+  ;; for them no longer than TOTAL (#29).
   (testing "HTTPS :timeout 1 (TOTAL) on a body that needs 2.4 s"
     (multiple-value-bind (port thread) (%drip-server 6 0.4 :tls t)
       (multiple-value-bind (res secs)
@@ -179,8 +176,6 @@
         (ok (< secs 2.0) (format nil "returned after ~,1F s" secs))))))
 
 (deftest http-total-deadline-fires
-  #+(or windows win32) (skip +winhttp-no-total+)
-  #-(or windows win32)
   (testing "plain HTTP :timeout 1 (TOTAL) on a body that needs 2.4 s"
     (multiple-value-bind (port thread) (%drip-server 6 0.4)
       (multiple-value-bind (res secs)
@@ -198,11 +193,63 @@
         (%finish-server port thread)
         (ok (typep res 'http-timeout-error)
             (format nil "got ~A after ~,1F s" (type-of res) secs))
-        ;; Windows (WinHTTP): the receive timeout is capped at TOTAL instead
-        ;; of a deadline; its connection setup on CI adds seconds, so only
-        ;; the outcome is checked there.
-        #-(or windows win32)
+        ;; Windows as well (#29): WinHTTP's receive timeout, capped at the
+        ;; total, fired there after 1.3 s to more than 4 s, so SEND no longer
+        ;; waits for WinHTTP past TOTAL.
         (ok (< secs 2.5) (format nil "returned after ~,1F s" secs))))))
+
+(deftest total-watchdog
+  (let ((watch #'http-backend-dexador::%call-with-watchdog)
+        (gave-up (lambda () :gave-up)))
+    (testing "a call that ends in time: its values, or its condition signalled again here"
+      (ok (equal '(1 2) (multiple-value-list (funcall watch 5 (lambda () (values 1 2)) gave-up))))
+      (let* ((c (make-condition 'simple-error :format-control "boom"))
+             (seen (handler-case (funcall watch 5 (lambda () (error c)) gave-up)
+                     (error (e) e))))
+        (ok (eq c seen) (format nil "the same condition: ~A" seen))))
+    (testing "a call that outlasts SECONDS: ON-TIMEOUT after SECONDS, the call left to end on its own"
+      (let* ((ended (list nil))
+             (start (get-internal-real-time))
+             (res (funcall watch 0.3 (lambda () (sleep 1) (setf (car ended) t) :late) gave-up))
+             (secs (%seconds-since start)))
+        (ok (eq :gave-up res) (format nil "got ~S" res))
+        (ok (< 0.25 secs 0.9) (format nil "after ~,2F s" secs))
+        (ok (not (car ended)) "the call had not ended yet")
+        (sleep 1.2)
+        (ok (car ended) "it ran to its end, and its value went nowhere")))
+    (testing "no time left: ON-TIMEOUT, and the call never starts"
+      (let ((ran (list nil)))
+        (ok (eq :gave-up (funcall watch 0 (lambda () (setf (car ran) t)) gave-up)))
+        (ok (eq :gave-up (funcall watch -1 (lambda () (setf (car ran) t)) gave-up)))
+        (sleep 0.1)
+        (ok (not (car ran)) "never called")))))
+
+(deftest detached-dexador-call
+  (flet ((cookie (name)
+           (cl-cookie:make-cookie :name name :value "1" :domain "example.com" :path "/")))
+    (let* ((jar (cl-cookie:make-cookie-jar :cookies (list (cookie "a"))))
+           (args (list :method :get :cookie-jar jar))
+           (seen nil)
+           (call (let ((dexador:*verbose* :from-the-caller))
+                   (http-backend-dexador::%detached-dexador-call
+                    (lambda (url &key method cookie-jar)
+                      (setf seen (list url method dexador:*verbose* cookie-jar))
+                      (cl-cookie:merge-cookies cookie-jar (list (cookie "b")))
+                      :done)
+                    "https://example.com/" args)))
+           (thread (bt:make-thread call :name "detached-dexador-call test")))
+      (bt:join-thread thread)
+      (destructuring-bind (url method verbose seen-jar) seen
+        (ok (and (equal "https://example.com/" url) (eq :get method)) "URL and ARGS reach dexador")
+        (ok (eq :from-the-caller verbose)
+            "dexador's specials are bound in the other thread as they were in the caller")
+        (ok (and (not (eq jar seen-jar))
+                 (equal '("a" "b") (mapcar #'cl-cookie:cookie-name
+                                           (cl-cookie:cookie-jar-cookies seen-jar))))
+            "the call gets a copy of the jar, with the caller's cookies")
+        (ok (equal '("a") (mapcar #'cl-cookie:cookie-name (cl-cookie:cookie-jar-cookies jar)))
+            "a cookie it merges stays out of the caller's jar")
+        (ok (eq jar (getf args :cookie-jar)) "ARGS are not changed")))))
 
 ;;; #23 — proxy URL reaches real dexador; SOCKS shapes
 
