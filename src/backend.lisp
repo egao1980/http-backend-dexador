@@ -623,7 +623,7 @@
 
 (defun %dexador-content (content headers)
   "CONTENT and HEADERS as dexador must get them to send CONTENT as it is
-   (#32). → (values content headers)
+   (#32), and a Content-Type with no CONTENT (#36). → (values content headers)
 
    Dexador's usocket backend encodes a body itself when the Content-Type it
    is given says so (its first content-type header, compared
@@ -637,11 +637,19 @@
    that is not UTF-8 text) keeps its octets, and its Content-Type value gets
    a leading space. That is optional whitespace before a field value (RFC
    9112 §5), which the recipient strips, and dexador's checks no longer
-   match. On Windows dexador's WinHTTP backend sends octets as they are."
+   match. With a NIL body dexador writes only Content-Length: 0 and skips
+   the caller's Content-Type, so a request with a Content-Type and no body
+   (S3's CreateMultipartUpload, whose signature covers the header) goes as
+   an empty octet body: dexador then writes the header and Content-Length:
+   0. On Windows dexador's WinHTTP backend sends octets and headers as they
+   are."
   #+(or windows win32) (values content headers)
   #-(or windows win32)
   (let* ((entry (assoc "content-type" headers :test #'string-equal))
          (type (cdr entry))
+         (content (if (and (null content) (stringp type))
+                      (make-array 0 :element-type '(unsigned-byte 8))
+                      content))
          (octets (and (typep content '(vector (unsigned-byte 8))) (stringp type)))
          (urlencoded (and octets (string= type "application/x-www-form-urlencoded")))
          (multipart (and octets
