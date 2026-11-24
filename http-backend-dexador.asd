@@ -39,6 +39,7 @@
                (:file "stream-timeout-test")
                (:file "proxy-form-test")
                (:file "stream-pool-test")
+               (:file "redirect-timeout-test")
                (:file "proxy-live-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
