@@ -1,5 +1,5 @@
 (defsystem "http-backend-dexador"
-  :version "0.2.3"
+  :version "0.2.4"
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"

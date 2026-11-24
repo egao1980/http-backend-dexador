@@ -679,25 +679,38 @@
     (setf (quri:uri-userinfo next) nil)
     (quri:render-uri next)))
 
+(defun %redirect-method (status method)
+  "The method a STATUS redirect of METHOD goes out with (RFC 9110 §15.4, as
+   the Fetch standard has it, and as http-backend-async does): 303 makes
+   anything but HEAD a GET, 301 and 302 make only POST a GET. 307, 308 and
+   every other case keep METHOD. requests also makes a 302 of any method but
+   HEAD a GET; the RFC does not."
+  (let ((name (string-upcase (string method))))
+    (if (or (and (= status 303) (string/= name "HEAD"))
+            (and (member status '(301 302)) (string= name "POST")))
+        :get
+        method)))
+
 (defun %redirect-request (status url next method headers content)
   "The request a STATUS redirect from URL to NEXT makes, by
    http-backend-async's rules. → (values method headers content)
 
-   307 and 308 send METHOD and CONTENT again. 301, 302 and 303 turn the
-   method into GET (HEAD stays HEAD) and drop the body and the headers that
-   describe it. Host is always dropped (dexador writes NEXT's), and on
-   another origin so are Authorization, Proxy-Authorization and Cookie, as
-   dexador's own redirects did; the cookie jar adds NEXT's cookies."
-  (let* ((keep (member status '(307 308)))
+   The method is %REDIRECT-METHOD's: 303 makes anything but HEAD a GET, 301
+   and 302 make only POST a GET. A hop that keeps its method sends CONTENT
+   again, except after a 303; one that does not drops the body and the
+   headers that describe it. Host is always dropped (dexador writes NEXT's),
+   and on another origin so are Authorization, Proxy-Authorization and
+   Cookie, as dexador's own redirects did; the cookie jar adds NEXT's
+   cookies."
+  (let* ((next-method (%redirect-method status method))
+         (keep (and (/= status 303) (eq next-method method)))
          (drop (append '("host")
                        (unless keep
                          '("content-type" "content-length" "content-encoding"
                            "transfer-encoding"))
                        (unless (%same-origin-p url next)
                          '("authorization" "proxy-authorization" "cookie")))))
-    (values (cond (keep method)
-                  ((string-equal method :head) :head)
-                  (t :get))
+    (values next-method
             (remove-if (lambda (header) (member (car header) drop :test #'string-equal))
                        headers)
             (and keep content))))
