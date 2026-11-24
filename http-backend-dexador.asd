@@ -40,6 +40,7 @@
                (:file "proxy-form-test")
                (:file "stream-pool-test")
                (:file "redirect-timeout-test")
+               (:file "https-proxy-test")
                (:file "proxy-live-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
