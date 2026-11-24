@@ -3,7 +3,10 @@
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("http-protocol" "dexador" "bordeaux-threads"
+  :depends-on ("http-protocol"
+               ;; 0.9.16.1 (egao1980/dexador fork): absolute-form to an HTTP proxy (#23)
+               (:version "dexador" "0.9.16.1")
+               "bordeaux-threads" "trivial-gray-streams"
                ;; off Windows dexador talks TLS through cl+ssl; the backend binds
                ;; its *default-unwrap-stream-p* (on Windows dexador uses WinHTTP)
                (:feature (:not (:or :windows :win32)) "cl+ssl")
@@ -30,7 +33,9 @@
                (:file "pooled-timeout-test")
                (:file "pool-verify-test")
                (:file "stream-timeout-test")
-               (:file "proxy-form-test"))
+               (:file "proxy-form-test")
+               (:file "stream-pool-test")
+               (:file "proxy-live-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

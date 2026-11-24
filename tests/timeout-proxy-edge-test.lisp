@@ -217,9 +217,9 @@
         #-(or windows win32)
         (progn
           (ok (typep res 'http-response) (format nil "got ~A" res))
-          ;; dexador 0.9.16 writes the origin form plus Host to a plain-HTTP
-          ;; proxy (not the RFC 9112 absolute form); either way it reached the
-          ;; proxy, which origin.test (no DNS) could not without it.
+          ;; It reached the proxy, which origin.test (no DNS) could not
+          ;; without it. The request line's absolute-form (dexador 0.9.16.1)
+          ;; is checked by plain-http-proxy-request-is-absolute-form.
           (ok (and (car head)
                    (search "/path?q=1 HTTP/1.1" (car head))
                    (search "Host: origin.test" (car head)))

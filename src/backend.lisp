@@ -127,12 +127,23 @@
    dies; integers are what dexador's own defaults use."
   (and seconds (max 1 (ceiling seconds))))
 
+(defun %dexador-read-seconds (seconds)
+  "dexador's :read-timeout for SECONDS. On SBCL off Windows, usocket makes it
+   the socket fd-stream's timeout, a float, so it stays exact (:read 1.5 waits
+   1.5 s, not 2). On Windows dexador hands it to WinHTTP, and other Lisps
+   differ: whole seconds there (%DEXADOR-SECONDS)."
+  #+(and sbcl (not (or windows win32)))
+  (and seconds (float (if (plusp seconds) seconds 1) 1.0))
+  #-(and sbcl (not (or windows win32)))
+  (%dexador-seconds seconds))
+
 (defun %dexador-timeouts (request client)
   "Map protocol HTTP-TIMEOUT onto dexador. → (values CONNECT READ TOTAL EXPLICIT-READ)
 
-   CONNECT / READ: whole seconds for dexador's :connect-timeout /
-   :read-timeout (each falls back to TOTAL, then 10 s; neither exceeds
-   TOTAL, which is all WinHTTP gets on Windows). Previously only NUMBER
+   CONNECT / READ: seconds for dexador's :connect-timeout / :read-timeout
+   (each falls back to TOTAL, then 10 s; neither exceeds TOTAL, which is all
+   WinHTTP gets on Windows). CONNECT is in whole seconds; READ is exact on
+   SBCL off Windows (see %DEXADOR-READ-SECONDS). Previously only NUMBER
    timeouts were forwarded, so plist/HTTP-TIMEOUT/NIL meant no deadline and
    SEND could hang (keep-alive reuse, fat PDFs).
    TOTAL: seconds the backend caps the whole attempt at (#24), or NIL.
@@ -142,10 +153,10 @@
          (read (timeout-read timeout))
          (total (timeout-total timeout))
          (total (and total (plusp total) total)))
-    (flet ((capped (seconds)
-             (%dexador-seconds (if total (min seconds total) seconds))))
-      (values (capped (timeout-connect-seconds timeout))
-              (capped (timeout-read-seconds timeout))
+    (flet ((cap (seconds)
+             (if total (min seconds total) seconds)))
+      (values (%dexador-seconds (cap (timeout-connect-seconds timeout)))
+              (%dexador-read-seconds (cap (timeout-read-seconds timeout)))
               total
               (and read (plusp read) (or (null total) (< read total)) read)))))
 
@@ -175,13 +186,16 @@
   #-sbcl
   (progn seconds (funcall thunk)))
 
-(defun %needs-lisp-bio-p (url explicit-read)
-  "True for an HTTPS request with its own read phase (see %CALL-WITH-TIMEOUTS).
-   Never on Windows: dexador runs over WinHTTP there, whose receive timeout
-   holds for HTTPS too."
-  #+(or windows win32) (declare (ignore url explicit-read))
+(defun %needs-lisp-bio-p (url explicit-read &optional want-stream)
+  "True for an HTTPS request whose reads must see the connection's read
+   timeout: one with its own read phase (see %CALL-WITH-TIMEOUTS), and a
+   streamed one (WANT-STREAM). A streamed body is read after SEND returns,
+   outside the TOTAL deadline, so only the read timeout ends a stalled body,
+   as it does on plain HTTP. Never on Windows: dexador runs over WinHTTP
+   there, whose receive timeout holds for HTTPS too."
+  #+(or windows win32) (declare (ignore url explicit-read want-stream))
   #+(or windows win32) nil
-  #-(or windows win32) (and explicit-read (%https-url-p url) t))
+  #-(or windows win32) (and (or explicit-read want-stream) (%https-url-p url) t))
 
 (defvar *max-connection-pools* 8
   "Pools kept at once. Making one more closes the idle connections of the
@@ -192,17 +206,22 @@
 
 (defvar *connection-pools-lock* (bt:make-lock "http-backend-dexador pools"))
 
-(defun %pool-key (url read-seconds lisp-bio proxy)
+(defun %pool-key (url read-seconds lisp-bio proxy verify)
   "Requests whose connections behave alike share a pool. Plain HTTP: by the
    fd-stream read timeout. HTTPS over cl+ssl's socket BIO: all together, since
    that BIO never sees the read timeout (the deadline bounds those requests).
    HTTPS over the Lisp BIO: by read timeout. PROXY is part of the key, as
    dexador's own key leaves it out and would hand a proxied connection to a
-   direct request for the same origin."
+   direct request for the same origin. So is VERIFY (dexador's :insecure is
+   NOT VERIFY): the certificate is checked only when a connection is opened,
+   and the pools are the backend's, shared by every client, so a :verify nil
+   client's connection must never serve a client that verifies. Plain HTTP
+   keeps it too, for the TLS connections a redirect to https:// opens."
   (list (cond ((not (%https-url-p url)) :http)
               (lisp-bio :https-lisp-bio)
               (t :https))
         (and (or lisp-bio (not (%https-url-p url))) read-seconds)
+        (if verify :verify :insecure)
         proxy))
 
 (defun %connection-pool (key)
@@ -266,6 +285,105 @@
                      (dexador.connection-cache:push-connection origin stream #'close)))
           (let ((dexador:*connection-pool* staging))
             (ignore-errors (dexador:clear-connection-pool)))))))
+
+(defclass dexador-body-stream (trivial-gray-streams:fundamental-binary-input-stream)
+  ((source :initarg :source :reader body-stream-source
+           :documentation "dexador's body stream (binary).")
+   (pool :initarg :pool :reader body-stream-pool
+         :documentation "The backend pool the connection came from.")
+   (read-seconds :initarg :read-seconds :initform nil
+                 :reader body-stream-read-seconds
+                 :documentation "The connection's read timeout, in seconds.")
+   (lisp-bio :initarg :lisp-bio :initform nil :reader body-stream-lisp-bio-p
+             :documentation "True when the connection reads TLS through cl+ssl's Lisp BIO.")
+   (eof :initform nil :accessor body-stream-eof-p))
+  (:documentation "A streamed response body over dexador's. Each read and the
+   close run with the backend pool as dexador's connection pool: dexador puts
+   a kept-alive connection back into DEXADOR:*CONNECTION-POOL* when its body
+   ends or is closed, and SEND's binding is gone by then, so the connection
+   went to dexador's global pool and was never reused. Closed before the
+   end, the connection is closed instead: dexador would pool it with unread
+   body octets still on the wire. A read that outlasts the connection's read
+   timeout signals HTTP-TIMEOUT-ERROR, as SEND does. TOTAL bounds SEND (the
+   status line and headers), not the reads after it, which the read timeout
+   bounds while the body keeps arriving (urllib3 and httpx stream the same
+   way; so does http-backend-async)."))
+
+(defun %elapsed-seconds (start)
+  (/ (- (get-internal-real-time) start)
+     (float internal-time-units-per-second 1d0)))
+
+(defun %call-body-io (stream thunk &optional (pool (body-stream-pool stream)))
+  "Call THUNK, one read or the close of STREAM's source, with POOL as
+   dexador's connection pool, mapping a timeout to HTTP-TIMEOUT-ERROR: an
+   OS or usocket timeout (plain HTTP), and a Lisp-BIO failure after the read
+   timeout (HTTPS; the BIO reports the fd-stream timeout as a generic
+   ssl-error, see %CALL-WITH-TIMEOUTS)."
+  (let ((dexador:*connection-pool* pool)
+        (start (get-internal-real-time))
+        (read (body-stream-read-seconds stream)))
+    (handler-bind
+        ((error
+          (lambda (c)
+            (cond ((typep c 'http-timeout-error) nil)
+                  ((%timeout-error-p c)
+                   (error 'http-timeout-error
+                          :message (format nil "dexador: read timeout on the response body (~A)" c)))
+                  ((and read
+                        (body-stream-lisp-bio-p stream)
+                        (%lisp-bio-failure-p c)
+                        (>= (%elapsed-seconds start) (* 0.95 read)))
+                   (error 'http-timeout-error
+                          :message (format nil "dexador: read timeout after ~,1F s on the response body" read)))))))
+      (funcall thunk))))
+
+(defmethod stream-element-type ((stream dexador-body-stream))
+  '(unsigned-byte 8))
+
+(defmethod trivial-gray-streams:stream-read-byte ((stream dexador-body-stream))
+  (let ((byte (%call-body-io stream
+                             (lambda () (read-byte (body-stream-source stream) nil :eof)))))
+    (when (eq byte :eof)
+      (setf (body-stream-eof-p stream) t))
+    byte))
+
+(defmethod trivial-gray-streams:stream-read-sequence
+    ((stream dexador-body-stream) sequence start end &key)
+  (let* ((end (or end (length sequence)))
+         (pos (%call-body-io stream
+                             (lambda ()
+                               (read-sequence sequence (body-stream-source stream)
+                                              :start start :end end)))))
+    (when (< pos end)
+      (setf (body-stream-eof-p stream) t))
+    pos))
+
+(defmethod trivial-gray-streams:stream-listen ((stream dexador-body-stream))
+  (and (not (body-stream-eof-p stream))
+       (%call-body-io stream (lambda () (listen (body-stream-source stream))))))
+
+(defmethod close ((stream dexador-body-stream) &key abort)
+  (when (open-stream-p stream)
+    (if (body-stream-eof-p stream)
+        (%call-body-io stream (lambda () (close (body-stream-source stream) :abort abort)))
+        ;; Not read to the end: let dexador pool the connection in a pool of
+        ;; its own, then close that pool's connections.
+        (let ((discard (dexador:make-connection-pool)))
+          (unwind-protect
+              (%call-body-io stream
+                             (lambda () (close (body-stream-source stream) :abort abort))
+                             discard)
+            (let ((dexador:*connection-pool* discard))
+              (dexador:clear-connection-pool))))))
+  (call-next-method))
+
+(defun %wrap-streamed-body (body pool read-seconds lisp-bio)
+  "BODY as a DEXADOR-BODY-STREAM when it is a stream (:want-stream t), else BODY."
+  (if (streamp body)
+      (make-instance 'dexador-body-stream
+                     :source body :pool pool
+                     :read-seconds read-seconds :lisp-bio lisp-bio)
+      body))
 
 (defun %call-with-timeouts (thunk &key total read lisp-bio)
   "Run THUNK (one dexador call) under the protocol timeouts dexador does not
@@ -347,6 +465,7 @@
                             (http-client-max-redirects client)))
          (proxy (%dexador-proxy request client url))
          (verify (http-client-verify client))
+         (want-stream (http-request-want-stream request))
          (cookie-jar (resolve-cookie-jar client request :url url)))
     (setf headers (inject-auth-range-headers
                    headers
@@ -373,12 +492,13 @@
                "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
       (multiple-value-bind (connect-timeout read-timeout total explicit-read)
           (%dexador-timeouts request client)
-        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read))
-               ;; A pooled connection keeps the read timeout (and BIO) it was
-               ;; opened with: take one only from the pool of connections
-               ;; opened the way this request would open one.
+        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read want-stream))
+               ;; A pooled connection keeps the read timeout, BIO and
+               ;; certificate check it was opened with: take one only from
+               ;; the pool of connections opened the way this request would
+               ;; open one.
                (pool (%connection-pool
-                      (%pool-key url read-timeout lisp-bio proxy)))
+                      (%pool-key url read-timeout lisp-bio proxy verify)))
                (take-pooled (and (%idempotent-method-p method) t)))
           (flet ((finish (body status resp-headers uri)
                    (let* ((final-url (if (typep uri 'quri:uri)
@@ -388,7 +508,8 @@
                                         cookie-jar final-url resp-headers)))
                      (multiple-value-bind (body* headers*)
                          (apply-response-content-encoding
-                          body resp-headers
+                          (%wrap-streamed-body body pool read-timeout lisp-bio)
+                          resp-headers
                           :decompress (http-request-decompress request))
                        (make-instance 'http-response
                                       :status status
@@ -423,8 +544,12 @@
                              :max-redirects (or max-redirects 5)
                              :proxy proxy
                              :insecure (not verify)
-                             :force-binary (http-request-force-binary request)
-                             :want-stream (http-request-want-stream request)
+                             ;; A streamed body reaches the caller as a binary
+                             ;; stream (http-protocol buffers octets): without
+                             ;; this a text/* body was a character stream.
+                             :force-binary (or (http-request-force-binary request)
+                                               (and want-stream t))
+                             :want-stream want-stream
                              :keep-alive t
                              :use-connection-pool t))))
                        :total total :read explicit-read :lisp-bio lisp-bio)

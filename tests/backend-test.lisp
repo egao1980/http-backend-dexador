@@ -276,8 +276,8 @@
           (make-http-request :method :get :url "https://example.com/"))
     (ok (integerp seen-connect))
     (ok (>= seen-connect 30)))
-  ;; Fractional seconds round up to whole seconds (usocket/Windows wants
-  ;; an integer millisecond count; 0.5 must not become "no timeout").
+  ;; A fractional connect timeout rounds up to whole seconds (usocket/Windows
+  ;; wants an integer millisecond count; 0.5 must not become "no timeout").
   (let* ((backend (make-instance 'dexador-backend))
          (client (make-http-client backend))
          (seen-connect nil)
@@ -293,7 +293,13 @@
                              :url "https://example.com/"
                              :timeout '(:connect 0.5 :read 2.25)))
     (ok (eql 1 seen-connect))
-    (ok (eql 3 seen-read))))
+    (progn
+      ;; SBCL off Windows: usocket makes the read timeout the fd-stream's,
+      ;; a float, so it stays exact; WinHTTP and other Lisps get whole seconds.
+      #+(and sbcl (not (or windows win32)))
+      (ok (= 2.25 seen-read) (format nil "read timeout ~S" seen-read))
+      #-(and sbcl (not (or windows win32)))
+      (ok (eql 3 seen-read)))))
 
 (define-condition %usocket-timeout-error (error) ()
   (:report (lambda (c s)
