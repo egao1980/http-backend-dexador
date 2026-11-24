@@ -186,16 +186,23 @@
   #-sbcl
   (progn seconds (funcall thunk)))
 
-(defun %needs-lisp-bio-p (url explicit-read &optional want-stream)
-  "True for an HTTPS request whose reads must see the connection's read
+(defun %needs-lisp-bio-p (url explicit-read &optional want-stream max-redirects)
+  "True for a request whose TLS reads must see the connection's read
    timeout: one with its own read phase (see %CALL-WITH-TIMEOUTS), and a
    streamed one (WANT-STREAM). A streamed body is read after SEND returns,
    outside the TOTAL deadline, so only the read timeout ends a stalled body,
-   as it does on plain HTTP. Never on Windows: dexador runs over WinHTTP
-   there, whose receive timeout holds for HTTPS too."
-  #+(or windows win32) (declare (ignore url explicit-read want-stream))
+   as it does on plain HTTP. TLS is opened for an https:// URL and, when
+   redirects are followed (MAX-REDIRECTS > 0), for an http:// URL too: its
+   redirect to https:// is read over the same BIO (#24). Never on Windows:
+   dexador runs over WinHTTP there, whose receive timeout holds for HTTPS
+   too."
+  #+(or windows win32) (declare (ignore url explicit-read want-stream max-redirects))
   #+(or windows win32) nil
-  #-(or windows win32) (and (or explicit-read want-stream) (%https-url-p url) t))
+  #-(or windows win32)
+  (and (or explicit-read want-stream)
+       (or (%https-url-p url)
+           (and max-redirects (plusp max-redirects)))
+       t))
 
 (defvar *max-connection-pools* 8
   "Pools kept at once. Making one more closes the idle connections of the
@@ -216,8 +223,11 @@
    NOT VERIFY): the certificate is checked only when a connection is opened,
    and the pools are the backend's, shared by every client, so a :verify nil
    client's connection must never serve a client that verifies. Plain HTTP
-   keeps it too, for the TLS connections a redirect to https:// opens."
-  (list (cond ((not (%https-url-p url)) :http)
+   keeps it too, for the TLS connections a redirect to https:// opens; for
+   the same reason plain HTTP is keyed by LISP-BIO, so a socket-BIO TLS
+   connection a redirect opened never serves a request that needs the read
+   timeout (#24)."
+  (list (cond ((not (%https-url-p url)) (if lisp-bio :http-lisp-bio :http))
               (lisp-bio :https-lisp-bio)
               (t :https))
         (and (or lisp-bio (not (%https-url-p url))) read-seconds)
@@ -437,12 +447,25 @@
    dexador 0.9.16 (cl-repository#172), and the .asd cannot require 0.9.16.1
    yet (cl-repository#171).")
 
+(defun %redact-proxy-url (proxy)
+  "PROXY (a URL string) without its userinfo, for error messages."
+  (let ((u (quri:uri proxy)))
+    (if (quri:uri-userinfo u)
+        (quri:render-uri (quri:make-uri :scheme (quri:uri-scheme u)
+                                        :host (quri:uri-host u)
+                                        :port (quri:uri-port u)
+                                        :path (quri:uri-path u)))
+        proxy)))
+
 (defun %dexador-proxy (request client url)
   "The proxy URL dexador gets for URL, or NIL for a direct connection (#23).
    The protocol proxy (request :proxy over the client's, else the system
    default) is an HTTP-PROXY-CONFIG; dexador takes a URL string. SOCKS goes
    out as socks5:// (dexador's SOCKS5 sends the host name, no auth). A
-   plain-HTTP URL through an HTTP proxy needs *DEXADOR-ABSOLUTE-FORM*."
+   plain-HTTP URL through an HTTP proxy needs *DEXADOR-ABSOLUTE-FORM*. An
+   https:// proxy (TLS to the proxy) is refused: dexador opens plain TCP to
+   it, so the request line and Proxy-Authorization would cross the wire in
+   cleartext."
   (let ((proxy (resolve-proxy (effective-proxy-config request client) url)))
     (when proxy
       (let ((proxy (if (stringp proxy) proxy (princ-to-string proxy))))
@@ -462,13 +485,18 @@
                   :operation :socks4-proxy
                   :message (format nil "http-backend-dexador: dexador has no SOCKS4 (~A); use http-backend-async" proxy)))
           (t
+           (when (string-equal "https" (quri:uri-scheme (quri:uri proxy)))
+             (error 'unsupported-operation
+                    :operation :https-proxy
+                    :message (format nil "http-backend-dexador: dexador speaks plain TCP to the proxy, so ~A would get the request and its credentials in cleartext; use an http:// proxy URL"
+                                     (%redact-proxy-url proxy))))
            (when (and (not *dexador-absolute-form*)
                       (null *dexador-request-fn*)
                       (not (%https-url-p url)))
              (error 'unsupported-operation
                     :operation :http-proxy-origin-form
                     :message (format nil "http-backend-dexador: this dexador (older than 0.9.16.1) would send ~A to the proxy ~A in origin-form, which forward proxies reject; update dexador, or use http-backend-async"
-                                     url proxy)))
+                                     url (%redact-proxy-url proxy))))
            proxy))))))
 
 (defmethod send ((backend dexador-backend) client request &key)
@@ -513,7 +541,7 @@
                "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
       (multiple-value-bind (connect-timeout read-timeout total explicit-read)
           (%dexador-timeouts request client)
-        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read want-stream))
+        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read want-stream (or max-redirects 5)))
                ;; A pooled connection keeps the read timeout, BIO and
                ;; certificate check it was opened with: take one only from
                ;; the pool of connections opened the way this request would

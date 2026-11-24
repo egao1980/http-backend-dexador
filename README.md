@@ -9,7 +9,7 @@ MIT. Sync [`http-protocol`](https://github.com/egao1980/http-protocol) backend o
 | Request CE | Opt-in `:content-encoding` |
 | Bodies | `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` (streams → async) |
 | Timeouts | See below. Every phase failure is an `http-timeout-error`. |
-| Proxy | `effective-proxy-config` (request `:proxy`, then the client's, then the system default) → `resolve-proxy` for the URL → dexador `:proxy` URL, or NIL for direct. Plain HTTP through an HTTP proxy goes out in absolute-form (`GET http://host/path`, RFC 9112 §3.2.2), which needs dexador ≥ 0.9.16.1 (the egao1980/dexador fork; 0.9.16 sent the origin-form and squid answered 400). With an older dexador such a request signals `unsupported-operation` instead. HTTPS goes through `CONNECT`. `no_proxy` is honoured. SOCKS5 / `socks5h` go out as `socks5://`. SOCKS4 and SOCKS5 with credentials signal `unsupported-operation`, because dexador has neither: use `http-backend-async`. |
+| Proxy | `effective-proxy-config` (request `:proxy`, then the client's, then the system default) → `resolve-proxy` for the URL → dexador `:proxy` URL, or NIL for direct. Plain HTTP through an HTTP proxy goes out in absolute-form (`GET http://host/path`, RFC 9112 §3.2.2), which needs dexador ≥ 0.9.16.1 (the egao1980/dexador fork; 0.9.16 sent the origin-form and squid answered 400). With an older dexador such a request signals `unsupported-operation` instead. HTTPS goes through `CONNECT`. `no_proxy` is honoured. SOCKS5 / `socks5h` go out as `socks5://`. SOCKS4 and SOCKS5 with credentials signal `unsupported-operation`, because dexador has neither: use `http-backend-async`. So does an `https://` proxy URL (TLS to the proxy): dexador opens plain TCP to every proxy, which would send the request line and `Proxy-Authorization` in cleartext. The error message leaves the proxy credentials out. |
 | 4xx/5xx | Returned as `http-response` (httpx style); `:raise-for-status t` to signal |
 
 ## Timeouts
@@ -30,9 +30,11 @@ applied as follows:
   never fired on HTTPS (#24). A request with its own read phase (`:read` with
   no `:total`, or one shorter than `:total`) therefore uses cl+ssl's Lisp BIO.
   Its TLS reads then go through the fd-stream, and silence longer than `:read`
-  ends the request while a body that keeps arriving is not cut off. The Lisp BIO
-  costs throughput: 20 MB over loopback took 120 ms with it and 15–35 ms
-  without.
+  ends the request while a body that keeps arriving is not cut off. An
+  `http://` URL that follows redirects (the default) uses it too, because its
+  redirect to `https://` reads over the same BIO; `:max-redirects 0` keeps the
+  socket BIO. The Lisp BIO costs throughput: 20 MB over loopback took 120 ms
+  with it and 15–35 ms without.
 - **streamed bodies** (`:want-stream t`) are read after `send` returns, so
   `:total` bounds `send` (status line and headers) but not the reads after it.
   Each body read waits at most the read timeout (`:read`, else `:total`, else
@@ -59,7 +61,8 @@ waited out the old 30 s, and a `:timeout 1` request cut later ones short.
 The backend keeps one dexador pool per kind of connection and binds
 `dexador:*connection-pool*` to it for each call:
 
-- plain HTTP: one pool per read timeout;
+- plain HTTP: one pool per read timeout and BIO (a redirect to `https://`
+  opens TLS in it);
 - HTTPS over cl+ssl's socket BIO: one pool (that BIO never sees the read
   timeout; the total deadline bounds those requests);
 - HTTPS over the Lisp BIO: one pool per read timeout;

@@ -90,7 +90,7 @@
       (declare (ignore c r))
       (ok (and (= 5 total) (null explicit)) "a read longer than the total is covered by the deadline"))))
 
-(defun %seen-pooling (url timeout &key (method :get) proxy)
+(defun %seen-pooling (url timeout &key (method :get) proxy max-redirects)
   "SEND one mocked request. → (keep-alive use-connection-pool unwrap-p pool)
    as dexador saw them; POOL is the DEXADOR:*CONNECTION-POOL* bound."
   (let* ((seen nil)
@@ -103,7 +103,8 @@
     (send (make-instance 'dexador-backend)
           (make-http-client (make-instance 'dexador-backend)
                             :proxy (make-http-proxy-config :system nil :use-system-proxy nil))
-          (make-http-request :url url :timeout timeout :method method :proxy proxy))
+          (make-http-request :url url :timeout timeout :method method :proxy proxy
+                             :max-redirects max-redirects))
     seen))
 
 (deftest lisp-bio-requests-use-their-own-pool
@@ -115,8 +116,16 @@
     #+(or windows win32)
     (ok (equal '(t t t) (flags "https://example.com/" '(:read 1)))
         "Windows: dexador runs over WinHTTP, whose receive timeout holds for HTTPS")
-    (ok (equal '(t t t) (flags "http://example.com/" '(:read 1)))
-        "plain HTTP: the pool, keep-alive and the default BIO setting")
+    (progn
+      #-(or windows win32)
+      (ok (equal '(t t nil) (flags "http://example.com/" '(:read 1)))
+          "plain HTTP that follows redirects: the pool, keep-alive and the Lisp BIO, for a redirect to https:// (#24)")
+      #+(or windows win32)
+      (ok (equal '(t t t) (flags "http://example.com/" '(:read 1)))
+          "Windows: plain HTTP keeps the default BIO setting")
+      (ok (equal '(t t t)
+                 (subseq (%seen-pooling "http://example.com/" '(:read 1) :max-redirects 0) 0 3))
+          "plain HTTP with :max-redirects 0 opens no TLS: the default BIO setting"))
     (ok (equal '(t t t) (flags "https://example.com/" 5))
         "HTTPS with a TOTAL only keeps the pool and the socket BIO")
     (testing "a pooled connection is only handed to a request that would open it the same way"
@@ -241,3 +250,17 @@
         "dexador has no SOCKS4")
     (ok (signals (seen "socks5://u:p@127.0.0.1:1080") 'unsupported-operation)
         "dexador's SOCKS5 has no authentication")))
+
+(deftest https-proxy-refused-without-credentials-in-message
+  (let ((c (handler-case
+               (%seen-proxy (make-http-client
+                             (make-instance 'dexador-backend)
+                             :proxy (make-http-proxy-config
+                                     :proxy "https://user:secret@proxy.test:443"
+                                     :system nil))
+                            (make-http-request :url "https://example.com/"))
+             (unsupported-operation (e) e))))
+    (ok (typep c 'unsupported-operation)
+        "an https:// proxy is refused: dexador would speak plain TCP to it")
+    (ok (not (search "secret" (princ-to-string c)))
+        (format nil "the message leaves the proxy credentials out: ~A" c))))
