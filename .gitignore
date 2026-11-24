@@ -1,3 +1,5 @@
 .qlot/
 *.fasl
 .DS_Store
+cl-repo.lock
+.cl-repository/

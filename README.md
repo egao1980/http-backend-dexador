@@ -1,13 +1,14 @@
 # http-backend-dexador
 
-MIT. Sync [`http-protocol`](https://github.com/egao1980/http-protocol) backend over [dexador](https://github.com/fukamachi/dexador). **OCI: 0.2.0.**
+MIT. Sync [`http-protocol`](https://github.com/egao1980/http-protocol) backend over [dexador](https://github.com/fukamachi/dexador). **OCI: 0.2.1.**
 
 | Concern | Behavior |
 |---------|----------|
 | `Accept-Encoding` | `default-accept-encoding`. The encoding backends are soft-loaded once per image through http-protocol's cached probe. |
 | Response CE | Auto-decode. Dexador already unwraps gzip/deflate; this backend handles `br` / `zstd` |
 | Request CE | Opt-in `:content-encoding` |
-| Bodies | `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` (streams → async) |
+| Bodies | `http-protocol` ≥ **0.2.0**: `:form-data` / typed `:data` / `:content` / `:files` reach the origin as http-protocol encoded them (#32). Dexador encodes a body again when its Content-Type is exactly `application/x-www-form-urlencoded` (it takes a non-string for an alist) or starts with `multipart/`. So an urlencoded body goes to it as the string it encodes, and any other such body (multipart, or a coded urlencoded body) keeps its octets, with a leading space in the Content-Type value: optional whitespace before a field value (RFC 9112 §5), which the recipient strips. Multipart and `:content-encoding` bodies are built in memory, as Requests does, because dexador has no stream writer. A stream passed as `:content` signals `unsupported-operation` (use `http-backend-async`). |
+| Redirects | Followed by the backend, one dexador request per hop (#33), with http-backend-async's rules. 307/308 resend the method and body. 301/302/303 become a GET (HEAD stays HEAD) without the body or its headers. A redirect to another origin drops `Authorization`, `Proxy-Authorization` and `Cookie` (the cookie jar adds the new origin's). `response-history` lists the redirects, oldest first. More than `:max-redirects` (default 5) signals `http-redirect-error`; `:max-redirects 0` returns the 3xx itself. Before 0.2.1 dexador followed them: the history was empty, the GET after a 303 sent the POST body again, and `Host` lost the port on another origin. |
 | Timeouts | See below. Every phase failure is an `http-timeout-error`. |
 | Proxy | `effective-proxy-config` (request `:proxy`, then the client's, then the system default) → `resolve-proxy` for the URL → dexador `:proxy` URL, or NIL for direct. Plain HTTP through an HTTP proxy goes out in absolute-form (`GET http://host/path`, RFC 9112 §3.2.2), which needs dexador ≥ 0.9.16.1 (the egao1980/dexador fork; 0.9.16 sent the origin-form and squid answered 400). With an older dexador such a request signals `unsupported-operation` instead. HTTPS goes through `CONNECT`. `no_proxy` is honoured. SOCKS5 / `socks5h` go out as `socks5://`. SOCKS4 and SOCKS5 with credentials signal `unsupported-operation`, because dexador has neither: use `http-backend-async`. So does an `https://` proxy URL (TLS to the proxy): dexador opens plain TCP to every proxy, which would send the request line and `Proxy-Authorization` in cleartext. The error message leaves the proxy credentials out. |
 | 4xx/5xx | Returned as `http-response` (httpx style); `:raise-for-status t` to signal |
@@ -97,7 +98,8 @@ cl-repo test
 ```
 
 The suite runs against loopback servers (plain and TLS, with a self-signed test certificate in
-`tests/certs/`). It covers mocks of `dex:request`, proxy resolution, and the read / total deadlines.
+`tests/certs/`). It covers mocks of `dex:request`, proxy resolution, the read / total deadlines,
+request bodies as the origin receives them, and redirects with their history.
 
 ## Publish
 
