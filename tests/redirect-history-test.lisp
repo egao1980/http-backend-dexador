@@ -109,6 +109,36 @@
          (ok (equalp (%bytes "abc") (cdr (first (car log))))
              "the body was sent again"))))))
 
+(deftest-parametrize redirect-hop-method
+    ((status method content want-line want-body)
+     (301 :head nil "HEAD /target HTTP/1.1" "")
+     (302 :head nil "HEAD /target HTTP/1.1" "")
+     (303 :head nil "HEAD /target HTTP/1.1" "")
+     (301 :post "x=1" "GET /target HTTP/1.1" "")
+     (302 :post "x=1" "GET /target HTTP/1.1" "")
+     (303 :post "x=1" "GET /target HTTP/1.1" "")
+     (303 :put "x=1" "GET /target HTTP/1.1" "")
+     (301 :put "x=1" "PUT /target HTTP/1.1" "x=1")
+     (302 :delete nil "DELETE /target HTTP/1.1" "")
+     (307 :post "x=1" "POST /target HTTP/1.1" "x=1")
+     (308 :put "x=1" "PUT /target HTTP/1.1" "x=1"))
+  (%call-with-origin
+   (list (list (format nil "/~D" status) (format nil "~D Redirect" status)
+               "Location: /target"))
+   (lambda (port log)
+     (let ((res (apply #'%send-to port method (format nil "/~D" status)
+                       (when content
+                         (list :content (%bytes content)
+                               :headers '(("content-type" . "text/plain")))))))
+       (ok (and (typep res 'http-response) (= 200 (response-status res)))
+           (%describe-outcome res))
+       (ok (equal want-line (car (last (%request-lines log))))
+           (format nil "~D ~A: the origin saw ~S" status method (%request-lines log)))
+       (ok (equal want-body (babel:octets-to-string (cdr (first (car log)))
+                                                    :encoding :utf-8))
+           (format nil "~D ~A: the target got the body ~S" status method
+                   (cdr (first (car log)))))))))
+
 (deftest too-many-redirects-signal
   (testing "/loop → 302 /loop with :max-redirects 3: HTTP-REDIRECT-ERROR after 3 redirects"
     (%call-with-origin
