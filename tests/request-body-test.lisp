@@ -167,6 +167,35 @@
                  (and head (%header-value head "content-length")))
           "Content-Length counts the octets sent"))))
 
+(deftest-parametrize content-type-without-a-body-reaches-the-origin
+    ((content-type)
+     :ids ("octet-stream" "xml" "urlencoded" "multipart")
+     ("application/octet-stream")
+     ("application/xml")
+     ("application/x-www-form-urlencoded")
+     ("multipart/form-data; boundary=XyZ"))
+  (testing (format nil "#36: POST with a Content-Type ~S header and no :content (S3 CreateMultipartUpload signs it): the origin gets the header and Content-Length 0"
+                   content-type)
+    (multiple-value-bind (result head seen)
+        (%post-to-origin :headers (list (cons "content-type" content-type)))
+      (ok (and (typep result 'http-response) (= 200 (response-status result)))
+          (%describe-outcome result))
+      (ok head "the request reached the origin")
+      (ok (equal content-type (and head (%header-value head "content-type")))
+          (format nil "Content-Type ~S" (and head (%header-value head "content-type"))))
+      (ok (equal "0" (and head (%header-value head "content-length")))
+          (format nil "Content-Length ~S" (and head (%header-value head "content-length"))))
+      (ok (and seen (zerop (length seen))) "no body"))))
+
+(deftest no-content-type-without-a-body
+  (testing "POST with no Content-Type and no :content: no Content-Type is added, Content-Length 0"
+    (multiple-value-bind (result head) (%post-to-origin)
+      (ok (and (typep result 'http-response) (= 200 (response-status result)))
+          (%describe-outcome result))
+      (ok (null (and head (%header-value head "content-type")))
+          (format nil "Content-Type ~S" (and head (%header-value head "content-type"))))
+      (ok (equal "0" (and head (%header-value head "content-length")))))))
+
 (deftest multipart-files-post-reaches-the-origin
   (testing ":form-data (k . v) with :files (f . \"file body\"): the origin gets http-protocol's multipart body"
     (multiple-value-bind (result head seen)
