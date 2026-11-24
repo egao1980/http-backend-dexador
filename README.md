@@ -26,6 +26,16 @@ applied as follows:
   body included for a slurped response. A bare number is `:total`, so
   `:timeout 2.0` fails a 5 s response after 2 s on HTTP and HTTPS alike. The
   deadline does not apply off SBCL.
+- **total on Windows**: dexador runs over WinHTTP there, whose blocking calls
+  no deadline reaches. WinHTTP's own timeouts bound one phase each and are
+  checked late: a 1 s receive timeout ended a call to a silent server after
+  1.3 s to more than 4 s on windows-latest (#29). Each dexador call therefore
+  runs in a thread of its own, and `send` waits for it no longer than what is
+  left of `:total`, then signals `http-timeout-error`. The call it gave up on
+  ends when WinHTTP's timeouts (capped at `:total`) fire or its response
+  ends; it works on a copy of the cookie jar, so a late response changes
+  nothing. `:read` on Windows is WinHTTP's receive timeout alone, so it can
+  fire late in the same way.
 - **read on HTTPS**: dexador puts `:read-timeout` on the socket's fd-stream,
   but cl+ssl's default socket BIO reads the raw descriptor, so that timeout
   never fired on HTTPS (#24). A request with its own read phase (`:read` with
