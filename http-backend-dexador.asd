@@ -27,7 +27,7 @@
   :in-order-to ((test-op (test-op "http-backend-dexador/tests"))))
 
 (defsystem "http-backend-dexador/tests"
-  :depends-on ("http-backend-dexador" "cl+ssl" "usocket" "bordeaux-threads" "rove")
+  :depends-on ("http-backend-dexador" "cl+ssl" "usocket" "bordeaux-threads" "babel" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
@@ -41,7 +41,9 @@
                (:file "stream-pool-test")
                (:file "redirect-timeout-test")
                (:file "https-proxy-test")
-               (:file "proxy-live-test"))
+               (:file "proxy-live-test")
+               (:file "request-body-test")
+               (:file "redirect-history-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
