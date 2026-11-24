@@ -447,57 +447,69 @@
    dexador 0.9.16 (cl-repository#172), and the .asd cannot require 0.9.16.1
    yet (cl-repository#171).")
 
-(defun %redact-proxy-url (proxy)
-  "PROXY (a URL string) without its userinfo, for error messages."
-  (let ((u (quri:uri proxy)))
-    (if (quri:uri-userinfo u)
-        (quri:render-uri (quri:make-uri :scheme (quri:uri-scheme u)
-                                        :host (quri:uri-host u)
-                                        :port (quri:uri-port u)
-                                        :path (quri:uri-path u)))
-        proxy)))
-
 (defun %dexador-proxy (request client url)
   "The proxy URL dexador gets for URL, or NIL for a direct connection (#23).
    The protocol proxy (request :proxy over the client's, else the system
-   default) is an HTTP-PROXY-CONFIG; dexador takes a URL string. SOCKS goes
-   out as socks5:// (dexador's SOCKS5 sends the host name, no auth). A
-   plain-HTTP URL through an HTTP proxy needs *DEXADOR-ABSOLUTE-FORM*. An
-   https:// proxy (TLS to the proxy) is refused: dexador opens plain TCP to
-   it, so the request line and Proxy-Authorization would cross the wire in
-   cleartext."
-  (let ((proxy (resolve-proxy (effective-proxy-config request client) url)))
-    (when proxy
-      (let ((proxy (if (stringp proxy) proxy (princ-to-string proxy))))
-        (case (proxy-kind proxy)
-          (:socks5
-           (let ((u (quri:uri proxy)))
-             (when (quri:uri-userinfo u)
-               (error 'unsupported-operation
-                      :operation :socks5-auth
-                      :message "http-backend-dexador: dexador's SOCKS5 has no authentication; use http-backend-async"))
-             (quri:render-uri
-              (quri:make-uri :scheme "socks5"
-                             :host (quri:uri-host u)
-                             :port (quri:uri-port u)))))
-          (:socks4
+   default) is an HTTP-PROXY-CONFIG; dexador takes a URL string. See
+   %DEXADOR-PROXY-URL for what goes through and what is refused."
+  (%dexador-proxy-url (resolve-proxy (effective-proxy-config request client) url)
+                      url))
+
+(defun %dexador-proxy-url (proxy url)
+  "The proxy URL dexador gets for PROXY (a resolved proxy URL, or NIL) and
+   URL. SOCKS goes out as socks5:// (dexador's SOCKS5 sends the host name,
+   no auth). A plain-HTTP URL through an HTTP proxy needs
+   *DEXADOR-ABSOLUTE-FORM*.
+
+   An https:// proxy (PROXY-KIND :HTTPS) signals PROXY-TLS-UNSUPPORTED before
+   any connection is opened (#53). dexador 0.9.16.1 cannot speak TLS to a
+   proxy: its connection code dials every proxy in plain TCP, so the request
+   line and Proxy-Authorization would go out in cleartext. Handing dexador a
+   TLS stream to the proxy is no way round it: on a failed request dexador
+   dials a new connection itself, in plain TCP to the proxy (http://) or
+   straight to the origin (https://). USE-VALUE takes another proxy URL, or
+   NIL for a direct connection; it is checked like this one."
+  (when proxy
+    (let ((proxy (if (stringp proxy) proxy (princ-to-string proxy))))
+      (case (proxy-kind proxy)
+        (:https
+         (restart-case
+             (error 'proxy-tls-unsupported
+                    :proxy (redact-proxy-url proxy)
+                    :backend "http-backend-dexador"
+                    :message "dexador dials every proxy in plain TCP; use http-backend-async, which speaks TLS to the proxy")
+           (use-value (other)
+             :report "Use another proxy URL (NIL: connect directly)."
+             :interactive (lambda ()
+                            (format *query-io* "Proxy URL (empty: direct): ")
+                            (force-output *query-io*)
+                            (let ((line (string-trim " " (read-line *query-io*))))
+                              (list (if (string= line "") nil line))))
+             (%dexador-proxy-url other url))))
+        (:socks5
+         (let ((u (quri:uri proxy)))
+           (when (quri:uri-userinfo u)
+             (error 'unsupported-operation
+                    :operation :socks5-auth
+                    :message "http-backend-dexador: dexador's SOCKS5 has no authentication; use http-backend-async"))
+           (quri:render-uri
+            (quri:make-uri :scheme "socks5"
+                           :host (quri:uri-host u)
+                           :port (quri:uri-port u)))))
+        (:socks4
+         (error 'unsupported-operation
+                :operation :socks4-proxy
+                :message (format nil "http-backend-dexador: dexador has no SOCKS4 (~A); use http-backend-async"
+                                 (redact-proxy-url proxy))))
+        (t
+         (when (and (not *dexador-absolute-form*)
+                    (null *dexador-request-fn*)
+                    (not (%https-url-p url)))
            (error 'unsupported-operation
-                  :operation :socks4-proxy
-                  :message (format nil "http-backend-dexador: dexador has no SOCKS4 (~A); use http-backend-async" proxy)))
-          (t
-           (when (string-equal "https" (quri:uri-scheme (quri:uri proxy)))
-             (error 'unsupported-operation
-                    :operation :https-proxy
-                    :message (format nil "http-backend-dexador: dexador speaks plain TCP to the proxy, so ~A would get the request and its credentials in cleartext; use an http:// proxy URL"
-                                     (%redact-proxy-url proxy))))
-           (when (and (not *dexador-absolute-form*)
-                      (null *dexador-request-fn*)
-                      (not (%https-url-p url)))
-             (error 'unsupported-operation
-                    :operation :http-proxy-origin-form
-                    :message (format nil "http-backend-dexador: this dexador (older than 0.9.16.1) would send ~A to the proxy ~A in origin-form, which forward proxies reject; update dexador, or use http-backend-async"
-                                     url (%redact-proxy-url proxy))))
-           proxy))))))
+                  :operation :http-proxy-origin-form
+                  :message (format nil "http-backend-dexador: this dexador (older than 0.9.16.1) would send ~A to the proxy ~A in origin-form, which forward proxies reject; update dexador, or use http-backend-async"
+                                   url (redact-proxy-url proxy))))
+         proxy)))))
 
 (defun %request-body (request)
   "PREPARE-REQUEST-BODY for dexador, which has no stream writer.
