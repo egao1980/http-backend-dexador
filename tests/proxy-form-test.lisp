@@ -38,4 +38,7 @@
               (progn
                 (ok (typep res 'unsupported-operation)
                     (format nil "dexador older than 0.9.16.1: got ~A" res))
-                (ok (null line) (format nil "the proxy saw nothing: ~S" line)))))))))
+                (ok (zerop (length line))
+                    ;; "" when %FINISH-SERVER's wake-up connection (no bytes) is what the
+                    ;; proxy accepted.
+                    (format nil "the proxy saw no request: ~S" line)))))))))
