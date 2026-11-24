@@ -21,36 +21,43 @@
   "Loopback HTTP/1.1 keep-alive server. GET /slow waits SLOW-SECONDS before
    it answers; any other path answers at once. Each connection gets its own
    thread. → (values port stop-fn log) where LOG is a cons whose CAR lists
-   the request lines seen, newest first (as (connection-number . line))."
+   the request lines seen, newest first (as (connection-number . line)).
+   STOP-FN wakes the acceptor with a connection of its own before it closes
+   the listener: on Linux closing a socket does not end an accept() blocked
+   on it in another thread, so the join hung the ubuntu lane."
   (let* ((server (usocket:socket-listen "127.0.0.1" 0
                                         :reuse-address t
                                         :element-type '(unsigned-byte 8)))
          (port (usocket:get-local-port server))
          (log (list nil))
          (lock (bt:make-lock "keep-alive log"))
+         (stopping (list nil))
          (conns 0))
     (labels ((serve (client n)
                (handler-case
                    (unwind-protect
-                        (let ((stream (usocket:socket-stream client)))
-                          (loop for head = (%read-head stream)
-                                while head
-                                do (let ((line (subseq head 0 (position #\Return head))))
-                                     (bt:with-lock-held (lock)
-                                       (push (cons n line) (car log)))
-                                     (when (search "/slow" line)
-                                       (sleep slow-seconds))
-                                     (write-sequence
-                                      (%bytes (format nil "HTTP/1.1 200 OK~C~CContent-Length: 2~C~C~C~Cok"
-                                                      #\Return #\Newline #\Return #\Newline
-                                                      #\Return #\Newline))
-                                      stream)
-                                     (finish-output stream))))
+                       (let ((stream (usocket:socket-stream client)))
+                         (loop for head = (%read-head stream)
+                               while head
+                               do (let ((line (subseq head 0 (position #\Return head))))
+                                    (bt:with-lock-held (lock)
+                                      (push (cons n line) (car log)))
+                                    (when (search "/slow" line)
+                                      (sleep slow-seconds))
+                                    (write-sequence
+                                     (%bytes (format nil "HTTP/1.1 200 OK~C~CContent-Length: 2~C~C~C~Cok"
+                                                     #\Return #\Newline #\Return #\Newline
+                                                     #\Return #\Newline))
+                                     stream)
+                                    (finish-output stream))))
                      (ignore-errors (usocket:socket-close client)))
                  (error () nil)))
              (accept-loop ()
                (handler-case
                    (loop (let ((client (usocket:socket-accept server)))
+                           (when (car stopping)
+                             (ignore-errors (usocket:socket-close client))
+                             (return))
                            (let ((n (incf conns)))
                              (bt:make-thread (lambda () (serve client n))
                                              :name "keep-alive origin conn"))))
@@ -58,8 +65,12 @@
       (let ((acceptor (bt:make-thread #'accept-loop :name "keep-alive origin")))
         (values port
                 (lambda ()
-                  (ignore-errors (usocket:socket-close server))
-                  (ignore-errors (bt:join-thread acceptor)))
+                  (setf (car stopping) t)
+                  (when (bt:thread-alive-p acceptor)
+                    (ignore-errors
+                      (usocket:socket-close (usocket:socket-connect "127.0.0.1" port))))
+                  (ignore-errors (bt:join-thread acceptor))
+                  (ignore-errors (usocket:socket-close server)))
                 log)))))
 
 (defun %pooled-pair (first-timeout second-timeout slow-seconds)
