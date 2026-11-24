@@ -1,9 +1,9 @@
 (defsystem "http-backend-dexador"
-  :version "0.2.1"
+  :version "0.2.2"
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("http-protocol"
+  :depends-on ((:version "http-protocol" "0.4.5")
                ;; Wants dexador 0.9.16.1 (egao1980/dexador fork: absolute-form to an
                ;; HTTP proxy, #23). (:version "dexador" "0.9.16.1") makes cl-repo pull
                ;; uiop:3.1.1 and fail (cl-repository#171), and a client image keeps
