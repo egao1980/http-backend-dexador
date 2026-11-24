@@ -499,6 +499,149 @@
                                      url (%redact-proxy-url proxy))))
            proxy))))))
 
+(defun %request-body (request)
+  "PREPARE-REQUEST-BODY for dexador, which has no stream writer.
+   → (values content extra-headers content-length)
+   http-protocol makes two kinds of body a stream itself: multipart (:files)
+   and a content coding (:content-encoding). Those are read into octets
+   here, as Requests builds a body in memory; SEND refused them before. A
+   stream the caller passes as :content stays a stream, which SEND refuses."
+  (multiple-value-bind (content extra-headers content-length)
+      (prepare-request-body request)
+    (let ((given (http-request-content request)))
+      (if (and (streamp content)
+               (or (http-request-files request)
+                   (not (or (streamp given)
+                            (and (http-file-p given)
+                                 (streamp (http-file-content given)))))))
+          (let ((octets (with-open-stream (s content) (slurp-octets s))))
+            (values octets extra-headers (length octets)))
+          (values content extra-headers content-length)))))
+
+(defun %utf-8-text (octets)
+  "The string whose UTF-8 encoding is OCTETS, or NIL when OCTETS are not
+   UTF-8 text (a gzip-coded body, say)."
+  (let ((text (handler-case (babel:octets-to-string octets :encoding :utf-8)
+                (babel:character-decoding-error () nil))))
+    (and text
+         (equalp octets (babel:string-to-octets text :encoding :utf-8))
+         text)))
+
+(defun %dexador-content (content headers)
+  "CONTENT and HEADERS as dexador must get them to send CONTENT as it is
+   (#32). → (values content headers)
+
+   Dexador's usocket backend encodes a body itself when the Content-Type it
+   is given says so (its first content-type header, compared
+   case-sensitively): exactly application/x-www-form-urlencoded makes it
+   url-encode a body that is not a string, taking it for an alist, and a
+   multipart/ type makes it write the parts of an alist under a boundary of
+   its own. http-protocol hands over encoded octets, and both failed. An
+   urlencoded body goes as the string it encodes: dexador takes a string as
+   already encoded and writes it as UTF-8, which gives back the octets. Any
+   other body those checks would catch (multipart, or an urlencoded body
+   that is not UTF-8 text) keeps its octets, and its Content-Type value gets
+   a leading space. That is optional whitespace before a field value (RFC
+   9112 §5), which the recipient strips, and dexador's checks no longer
+   match. On Windows dexador's WinHTTP backend sends octets as they are."
+  #+(or windows win32) (values content headers)
+  #-(or windows win32)
+  (let* ((entry (assoc "content-type" headers :test #'string-equal))
+         (type (cdr entry))
+         (octets (and (typep content '(vector (unsigned-byte 8))) (stringp type)))
+         (urlencoded (and octets (string= type "application/x-www-form-urlencoded")))
+         (multipart (and octets
+                         (>= (length type) 10)
+                         (string= type "multipart/" :end1 10)))
+         (text (and urlencoded (%utf-8-text content))))
+    (cond (text
+           (values text headers))
+          ((or urlencoded multipart)
+           (values content
+                   (substitute (cons (car entry) (concatenate 'string " " type))
+                               entry headers :test #'eq)))
+          (t
+           (values content headers)))))
+
+(defun %redirect-status-p (status)
+  (and (member status '(301 302 303 307 308)) t))
+
+(defun %same-origin-p (url other)
+  "True when URL and OTHER have the same scheme, host and port."
+  (let ((a (quri:uri url)) (b (quri:uri other)))
+    (and (string-equal (quri:uri-scheme a) (quri:uri-scheme b))
+         (string-equal (quri:uri-host a) (quri:uri-host b))
+         (eql (quri:uri-port a) (quri:uri-port b)))))
+
+(defun %redirect-url (url location)
+  "LOCATION, a redirect's Location header, resolved against URL. → the
+   absolute URL to follow, without userinfo (as dexador). Signals
+   HTTP-REDIRECT-ERROR for a scheme other than http and https."
+  (let ((next (quri:merge-uris (quri:uri location) (quri:uri url))))
+    (unless (member (quri:uri-scheme next) '("http" "https") :test #'string-equal)
+      (error 'http-redirect-error
+             :message (format nil "http-backend-dexador: disallowed redirect scheme ~A (Location ~A)"
+                              (quri:uri-scheme next) location)))
+    (setf (quri:uri-userinfo next) nil)
+    (quri:render-uri next)))
+
+(defun %redirect-request (status url next method headers content)
+  "The request a STATUS redirect from URL to NEXT makes, by
+   http-backend-async's rules. → (values method headers content)
+
+   307 and 308 send METHOD and CONTENT again. 301, 302 and 303 turn the
+   method into GET (HEAD stays HEAD) and drop the body and the headers that
+   describe it. Host is always dropped (dexador writes NEXT's), and on
+   another origin so are Authorization, Proxy-Authorization and Cookie, as
+   dexador's own redirects did; the cookie jar adds NEXT's cookies."
+  (let* ((keep (member status '(307 308)))
+         (drop (append '("host")
+                       (unless keep
+                         '("content-type" "content-length" "content-encoding"
+                           "transfer-encoding"))
+                       (unless (%same-origin-p url next)
+                         '("authorization" "proxy-authorization" "cookie")))))
+    (values (cond (keep method)
+                  ((string-equal method :head) :head)
+                  (t :get))
+            (remove-if (lambda (header) (member (car header) drop :test #'string-equal))
+                       headers)
+            (and keep content))))
+
+(defun %follow-redirects (call finish url method headers content max-redirects)
+  "Send a request and follow its redirects (#33). CALL makes one dexador
+   request that does not follow them: (CALL url method headers content) →
+   (values body status headers uri failed-p). FINISH makes the response:
+   (FINISH body status headers uri history settle) → an HTTP-RESPONSE.
+   → (values response failed-p)
+
+   A redirect (301 302 303 307 308 with a Location) is followed while
+   MAX-REDIRECTS allows; with MAX-REDIRECTS 0 it is the response. Each one
+   followed goes into the final response's RESPONSE-HISTORY, oldest first,
+   with its body read (SETTLE). One more than MAX-REDIRECTS signals
+   HTTP-REDIRECT-ERROR, as on http-backend-async. Dexador followed them
+   itself and kept only the last response; its GET after a 303 also sent
+   the POST body again, and its Host for another origin lost the port."
+  (loop with history = '()
+        for hops from 0
+        do (multiple-value-bind (body status resp-headers uri failed)
+               (funcall call url method headers content)
+             (let ((location (and (%redirect-status-p status)
+                                  (gethash "location" resp-headers))))
+               (when (or (not (stringp location)) (zerop max-redirects))
+                 (return (values (funcall finish body status resp-headers uri
+                                          (reverse history) nil)
+                                 failed)))
+               (when (>= hops max-redirects)
+                 (error 'http-redirect-error
+                        :message (format nil "http-backend-dexador: exceeded max-redirects (~D) at ~A"
+                                         max-redirects url)))
+               (push (funcall finish body status resp-headers uri nil t) history)
+               (let ((next (%redirect-url url location)))
+                 (multiple-value-setq (method headers content)
+                                      (%redirect-request status url next method headers content))
+                 (setf url next))))))
+
 (defmethod send ((backend dexador-backend) client request &key)
   ;; Dexador is HTTP/1.1 only — refuse forced HTTP/2 up front.
   (ensure-http-version-available
@@ -511,7 +654,8 @@
                                   (http-request-headers request)))
          (ae (%accept-encoding-header (http-request-accept-encoding request)))
          (max-redirects (or (http-request-max-redirects request)
-                            (http-client-max-redirects client)))
+                            (http-client-max-redirects client)
+                            5))
          (proxy (%dexador-proxy request client url))
          (verify (http-client-verify client))
          (want-stream (http-request-want-stream request))
@@ -525,7 +669,7 @@
                            (remove "accept-encoding" headers
                                    :key #'car :test #'string-equal))))
     (multiple-value-bind (content extra-headers content-length)
-        (prepare-request-body request)
+        (%request-body request)
       (setf headers (%merge-extra-headers headers extra-headers))
       (when content-length
         (setf headers (%merge-extra-headers
@@ -539,17 +683,54 @@
                :operation :stream-body
                :message
                "http-backend-dexador: streaming request bodies need http-backend-async (or pass octets); dexador has no stream writer"))
+      (multiple-value-setq (content headers) (%dexador-content content headers))
       (multiple-value-bind (connect-timeout read-timeout total explicit-read)
           (%dexador-timeouts request client)
-        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read want-stream (or max-redirects 5)))
+        (let* ((lisp-bio (%needs-lisp-bio-p url explicit-read want-stream max-redirects))
                ;; A pooled connection keeps the read timeout, BIO and
                ;; certificate check it was opened with: take one only from
                ;; the pool of connections opened the way this request would
-               ;; open one.
+               ;; open one. The redirects it follows use the same pool and
+               ;; proxy, as when dexador followed them.
                (pool (%connection-pool
-                      (%pool-key url read-timeout lisp-bio proxy verify)))
-               (take-pooled (and (%idempotent-method-p method) t)))
-          (flet ((finish (body status resp-headers uri)
+                      (%pool-key url read-timeout lisp-bio proxy verify))))
+          (flet ((call (url method headers content)
+                   ;; One request, redirects not followed. → (values body
+                   ;; status headers uri failed-p); FAILED-P for a 4xx/5xx.
+                   (handler-case
+                       (multiple-value-bind (body status resp-headers uri)
+                           (%call-with-connection-pool
+                            pool url (and (%idempotent-method-p method) t)
+                            (lambda ()
+                              (%call-dexador
+                               url
+                               :method method
+                               :headers headers
+                               :content content
+                               :cookie-jar cookie-jar
+                               :connect-timeout connect-timeout
+                               :read-timeout read-timeout
+                               :max-redirects 0
+                               :proxy proxy
+                               :insecure (not verify)
+                               ;; A streamed body reaches the caller as a binary
+                               ;; stream (http-protocol buffers octets): without
+                               ;; this a text/* body was a character stream.
+                               :force-binary (or (http-request-force-binary request)
+                                                 (and want-stream t))
+                               :want-stream want-stream
+                               :keep-alive t
+                               :use-connection-pool t)))
+                         (values body status resp-headers uri nil))
+                     (dexador:http-request-failed (e)
+                       (values (dexador:response-body e)
+                               (dexador:response-status e)
+                               (dexador:response-headers e)
+                               (dexador:request-uri e)
+                               t))))
+                 (finish (body status resp-headers uri history settle)
+                   ;; SETTLE (a redirect in the history): read a streamed
+                   ;; body to the end, which releases its connection.
                    (let* ((final-url (if (typep uri 'quri:uri)
                                          (quri:render-uri uri)
                                          (if uri (princ-to-string uri) url)))
@@ -560,12 +741,15 @@
                           (%wrap-streamed-body body pool read-timeout lisp-bio)
                           resp-headers
                           :decompress (http-request-decompress request))
+                       (when (and settle (streamp body*))
+                         (setf body* (with-open-stream (s body*) (slurp-octets s))))
                        (make-instance 'http-response
                                       :status status
                                       :headers headers*
                                       :body body*
                                       :url final-url
                                       :cookies set-cookies
+                                      :history history
                                       :http-version :http/1.1
                                       :request request)))))
             (handler-bind
@@ -575,39 +759,12 @@
                                (not (typep c 'http-timeout-error)))
                       (error 'http-timeout-error
                              :message (princ-to-string c))))))
-              (handler-case
-                  (multiple-value-bind (body status resp-headers uri)
-                      (%call-with-timeouts
-                       (lambda ()
-                         (%call-with-connection-pool
-                          pool url take-pooled
-                          (lambda ()
-                            (%call-dexador
-                             url
-                             :method method
-                             :headers headers
-                             :content content
-                             :cookie-jar cookie-jar
-                             :connect-timeout connect-timeout
-                             :read-timeout read-timeout
-                             :max-redirects (or max-redirects 5)
-                             :proxy proxy
-                             :insecure (not verify)
-                             ;; A streamed body reaches the caller as a binary
-                             ;; stream (http-protocol buffers octets): without
-                             ;; this a text/* body was a character stream.
-                             :force-binary (or (http-request-force-binary request)
-                                               (and want-stream t))
-                             :want-stream want-stream
-                             :keep-alive t
-                             :use-connection-pool t))))
-                       :total total :read explicit-read :lisp-bio lisp-bio)
-                    (finish body status resp-headers uri))
-                (dexador:http-request-failed (e)
-                  (let ((res (finish (dexador:response-body e)
-                                     (dexador:response-status e)
-                                     (dexador:response-headers e)
-                                     (dexador:request-uri e))))
-                    (if (http-request-raise-for-status request)
-                        (raise-for-status res)
-                        res)))))))))))
+              (multiple-value-bind (res failed)
+                  (%call-with-timeouts
+                   (lambda ()
+                     (%follow-redirects #'call #'finish
+                                        url method headers content max-redirects))
+                   :total total :read explicit-read :lisp-bio lisp-bio)
+                (if (and failed (http-request-raise-for-status request))
+                    (raise-for-status res)
+                    res)))))))))

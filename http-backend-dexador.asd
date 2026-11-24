@@ -1,5 +1,5 @@
 (defsystem "http-backend-dexador"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "dexador sync backend for http-protocol"
   :author "egao1980"
   :license "MIT"
@@ -14,7 +14,7 @@
                ;; off Windows dexador talks TLS through cl+ssl; the backend binds
                ;; its *default-unwrap-stream-p* (on Windows dexador uses WinHTTP)
                (:feature (:not (:or :windows :win32)) "cl+ssl")
-               "quri")
+               "babel" "quri")
   :properties
   (:cl-repo
    (:ci (:with ("cl-stack-ssl" "http-encoding-chipz")

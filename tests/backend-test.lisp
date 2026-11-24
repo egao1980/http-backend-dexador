@@ -111,7 +111,9 @@
                   (decode-content-coding :gzip octets))))))
 
 (deftest request-form-data-urlencoded
-  "http-protocol 0.2 :form-data → urlencoded + Content-Type."
+  "http-protocol 0.2 :form-data → urlencoded + Content-Type. Dexador gets
+   the encoded form: off Windows as a string (#32: it url-encodes any other
+   urlencoded body again), which it writes as UTF-8."
   (let* ((backend (make-instance 'dexador-backend))
          (client (make-http-client backend))
          (seen-content nil)
@@ -128,10 +130,9 @@
                              :url "https://example.com/"
                              :form-data '(("q" . "hi there"))))
     (ok (string-equal "application/x-www-form-urlencoded" seen-ct))
-    (ok (equalp (%bytes "q=hi+there")
-                (if (streamp seen-content)
-                    (slurp-octets seen-content)
-                    seen-content)))))
+    #-(or windows win32)
+    (ok (stringp seen-content) "an urlencoded body reaches dexador as a string")
+    (ok (equalp (%bytes "q=hi+there") (coerce-to-octets seen-content)))))
 
 (deftest request-typed-data-text
   (let* ((backend (make-instance 'dexador-backend))
